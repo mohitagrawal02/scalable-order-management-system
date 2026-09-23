@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Build output
+backend/dist/
+
+# Environment files (never commit real secrets)
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# TypeScript incremental build info
+*.tsbuildinfo
+
+# Local scratch / verification artifacts (never part of the deliverable)
+*.tmp
+scratch/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+
+# MySQL local data dir (used on machines where the MySQL service is unavailable)
+mysql-local-data/

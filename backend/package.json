@@ -1,0 +1,46 @@
+{
+  "name": "ecommerce-platform-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "E-commerce & order management platform - backend API (Node.js + Express + TypeScript + Prisma/MySQL)",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "typecheck": "tsc --noEmit",
+    "test": "node --require ./tests/register.cjs --test --test-concurrency=1 tests/integration/cart.test.ts tests/integration/orders.test.ts",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:studio": "prisma studio"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "ecommerce",
+    "express",
+    "typescript",
+    "prisma",
+    "mysql"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@prisma/client": "^6.19.3",
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "helmet": "^8.3.0",
+    "jsonwebtoken": "^9.0.3"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^22.20.2",
+    "prisma": "^6.19.3",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,250 @@
+// ============================================================================
+// E-Commerce Platform - Prisma Schema
+// ============================================================================
+// MySQL is the primary database (see docs/ARCHITECTURE.md for rationale).
+//
+// Design conventions used throughout this schema:
+//   * Surrogate auto-increment integer primary keys (simple, index-friendly).
+//     Public-facing identifiers (UUIDs / cuid) can be added later if needed.
+//   * Money values use Decimal(10,2) - precise, not floating point.
+//   * Enums for columns that have a fixed, known set of states.
+//   * Relations use clear onDelete behaviour (Restrict / Cascade / SetNull).
+//   * Indexes are added ONLY where a concrete query pattern already exists.
+//     Foreign keys are indexed automatically by MySQL - we do not repeat them.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// Users & Roles
+// ----------------------------------------------------------------------------
+
+enum Role {
+  CUSTOMER
+  ADMIN
+}
+
+model User {
+  id           Int    @id @default(autoincrement())
+  email        String @unique @db.VarChar(255)
+  passwordHash String @map("password_hash") @db.VarChar(255)
+  name         String
+  role         Role   @default(CUSTOMER)
+
+  cart          Cart?          @relation("CartOwner")
+  orders        Order[]
+  notifications Notification[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("users")
+}
+
+// ----------------------------------------------------------------------------
+// Product Catalog
+// ----------------------------------------------------------------------------
+
+model Product {
+  id          Int     @id @default(autoincrement())
+  name        String  @db.VarChar(255)
+  description String  @db.Text
+  price       Decimal @db.Decimal(10, 2)
+  currency    String  @default("USD") @db.VarChar(3)
+  sku         String  @unique @db.VarChar(64)
+  category    String  @db.VarChar(100)
+  isActive    Boolean @default(true) @map("is_active")
+
+  inventory  Inventory?
+  cartItems  CartItem[]
+  orderItems OrderItem[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Category is a first-class browse filter (Day 1).
+  @@index([category], map: "idx_products_category")
+  // minPrice/maxPrice range filtering is a first-class browse filter (Day 3);
+  // a plain B-tree index turns `price BETWEEN x AND y` into an index range
+  // scan instead of a full table scan.
+  @@index([price], map: "idx_products_price")
+  @@map("products")
+}
+
+// ----------------------------------------------------------------------------
+// Inventory
+// ----------------------------------------------------------------------------
+// Stock is tracked separately from the catalog so that the product catalog
+// and high-frequency stock writes can evolve independently.
+
+model Inventory {
+  id               Int @id @default(autoincrement())
+  productId        Int @unique @map("product_id")
+  quantity         Int @default(0)
+  reservedQuantity Int @default(0) @map("reserved_quantity")
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("inventory")
+}
+
+// ----------------------------------------------------------------------------
+// Shopping Cart
+// ----------------------------------------------------------------------------
+
+model Cart {
+  id     Int @id @default(autoincrement())
+  userId Int @unique @map("user_id")
+
+  user  User       @relation("CartOwner", fields: [userId], references: [id], onDelete: Cascade)
+  items CartItem[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("carts")
+}
+
+model CartItem {
+  id        Int @id @default(autoincrement())
+  cartId    Int @map("cart_id")
+  productId Int @map("product_id")
+  quantity  Int @default(1)
+
+  cart    Cart    @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // One row per (cart, product) - adding a product twice upserts instead.
+  @@unique([cartId, productId], map: "uq_cart_items_cart_product")
+  @@map("cart_items")
+}
+
+// ----------------------------------------------------------------------------
+// Orders
+// ----------------------------------------------------------------------------
+
+enum OrderStatus {
+  PENDING
+  PAYMENT_PROCESSING
+  PAID
+  FULFILLED
+  SHIPPED
+  DELIVERED
+  CANCELLED
+  REFUNDED
+}
+
+model Order {
+  id              Int         @id @default(autoincrement())
+  orderNumber     String      @unique @map("order_number") @db.VarChar(32)
+  userId          Int         @map("user_id")
+  status          OrderStatus @default(PENDING)
+  totalAmount     Decimal     @map("total_amount") @db.Decimal(10, 2)
+  shippingAddress String      @map("shipping_address") @db.VarChar(500)
+
+  user    User        @relation(fields: [userId], references: [id], onDelete: Restrict)
+  items   OrderItem[]
+  payment Payment?
+
+  createdAt     DateTime       @default(now()) @map("created_at")
+  updatedAt     DateTime       @updatedAt @map("updated_at")
+  notifications Notification[]
+
+  // "My orders" browsing for a user is THE core query in Day-2 work.
+  @@index([userId], map: "idx_orders_user_id")
+  // Admin "orders by status" list is a core admin query later.
+  @@index([status], map: "idx_orders_status")
+  @@map("orders")
+}
+
+model OrderItem {
+  id        Int     @id @default(autoincrement())
+  orderId   Int     @map("order_id")
+  productId Int     @map("product_id")
+  quantity  Int
+  unitPrice Decimal @map("unit_price") @db.Decimal(10, 2)
+
+  order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("order_items")
+}
+
+// ----------------------------------------------------------------------------
+// Payments
+// ----------------------------------------------------------------------------
+// Simulated payment processing for now (no real PSP integration).
+
+enum PaymentStatus {
+  PENDING
+  PROCESSING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+}
+
+enum PaymentMethod {
+  CARD
+  UPI
+  COD
+}
+
+model Payment {
+  id             Int           @id @default(autoincrement())
+  orderId        Int           @unique @map("order_id")
+  amount         Decimal       @db.Decimal(10, 2)
+  status         PaymentStatus @default(PENDING)
+  method         PaymentMethod
+  transactionRef String?       @unique @map("transaction_ref") @db.VarChar(64)
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("payments")
+}
+
+// ----------------------------------------------------------------------------
+// Notifications
+// ----------------------------------------------------------------------------
+
+enum NotificationType {
+  ORDER_CONFIRMED
+  PAYMENT_SUCCEEDED
+  PAYMENT_FAILED
+  ORDER_SHIPPED
+  ORDER_CANCELLED
+  ORDER_DELIVERED
+}
+
+model Notification {
+  id      Int              @id @default(autoincrement())
+  userId  Int              @map("user_id")
+  orderId Int?             @map("order_id")
+  type    NotificationType
+  message String           @db.VarChar(500)
+  isRead  Boolean          @default(false) @map("is_read")
+
+  user  User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  order Order? @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // "Latest notifications for a user, newest first" is the core query.
+  @@index([userId, createdAt], map: "idx_notifications_user_created")
+  @@map("notifications")
+}
