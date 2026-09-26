@@ -2,6 +2,13 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '../../config/prisma';
 import { AppError } from '../../errors/AppError';
 import {
+  getCachedProduct,
+  getCachedProductList,
+  invalidateProductCaches,
+  setCachedProduct,
+  setCachedProductList,
+} from './product.cache';
+import {
   CreateProductInput,
   ListProductsParams,
   PaginationMeta,
@@ -14,6 +21,11 @@ import {
  *
  * Controllers validate the request, hand over a typed input, and shape the
  * response. Services own all business rules and Prisma interactions.
+ *
+ * Day 6 added the cache-aside read path for the two public read endpoints and
+ * invalidation on every admin write. MySQL stays the source of truth: the
+ * cache is consulted first, but every miss/error path ends in the same Prisma
+ * query as before (see product.cache.ts).
  */
 
 /** Maps a Prisma Product row to the public response shape (money as string). */
@@ -91,6 +103,11 @@ export async function createProduct(input: CreateProductInput): Promise<ProductR
         category: input.category,
       },
     });
+
+    // A new product can appear in existing list results (every filter/page),
+    // so the whole list namespace is retired. No detail entry can exist yet.
+    await invalidateProductCaches();
+
     return formatProduct(product);
   } catch (err) {
     if (isUniqueConstraintError(err)) {
@@ -115,6 +132,11 @@ export async function updateProduct(
 
   try {
     const product = await prisma.product.update({ where: { id }, data });
+
+    // Commit first, invalidate second: if invalidation fails, the API already
+    // succeeded and the cache self-corrects within one TTL.
+    await invalidateProductCaches(id);
+
     return formatProduct(product);
   } catch (err) {
     if (isUniqueConstraintError(err)) {
@@ -163,12 +185,22 @@ async function buildListWhere(params: ListProductsParams): Promise<Prisma.Produc
 /**
  * Lists one page of products + pagination metadata.
  *
+ * Cache-aside (Day 6):
+ *   GET product:list:v<version>:<hash(normalized query)>
+ *     hit  → return the stored payload (no MySQL round trip at all)
+ *     miss → run the two queries below, store the payload with a TTL, return it
+ *
  * Two queries run in a transaction for consistency: COUNT(*) for metadata
  * and the LIMIT/OFFSET page. We never pull the whole table into memory.
  */
 export async function listProducts(
   params: ListProductsParams
 ): Promise<{ data: ProductResponse[]; pagination: PaginationMeta }> {
+  const cached = await getCachedProductList(params);
+  if (cached.outcome === 'hit') {
+    return cached.value;
+  }
+
   const { page, limit } = params;
   const where = await buildListWhere(params);
 
@@ -183,7 +215,7 @@ export async function listProducts(
     }),
   ]);
 
-  return {
+  const payload = {
     data: products.map(formatProduct),
     pagination: {
       page,
@@ -192,18 +224,31 @@ export async function listProducts(
       totalPages: Math.max(1, Math.ceil(total / limit)),
     },
   };
+
+  await setCachedProductList(params, payload);
+  return payload;
 }
 
 /** Returns one active product; 404 when missing or inactive. */
 export async function getProductById(id: number): Promise<ProductResponse> {
+  const cached = await getCachedProduct(id);
+  if (cached.outcome === 'hit') {
+    return cached.value;
+  }
+
   const product = await prisma.product.findFirst({
     where: { id, isActive: true },
     select: PRODUCT_SAFE_SELECT,
   });
   if (!product) {
+    // Deliberately NOT cached: negative entries would need their own
+    // invalidation on create/update to avoid serving 404 for a live product.
     throw new AppError('Product not found', 404);
   }
-  return formatProduct(product);
+
+  const formatted = formatProduct(product);
+  await setCachedProduct(id, formatted);
+  return formatted;
 }
 
 /**
@@ -243,4 +288,8 @@ export async function deleteProduct(id: number): Promise<void> {
   }
 
   await prisma.product.delete({ where: { id } });
+
+  // Deleted: the detail entry must disappear immediately, and every list page
+  // must be rebuilt without this product.
+  await invalidateProductCaches(id);
 }

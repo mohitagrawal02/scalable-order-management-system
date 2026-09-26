@@ -4,10 +4,11 @@ A **learning-oriented, production-style** e-commerce platform. Designed to grow
 from a small, well-structured application into a scalable event-driven system â€”
 one deliberate stage at a time.
 
-> **Status: Days 1â€“5 complete.** Backend foundation, MySQL schema, JWT auth,
+> **Status: Days 1–6 complete.** Backend foundation, MySQL schema, JWT auth,
 > admin product catalog, the shopping cart, transactional checkout with
-> concurrency-safe inventory, and **simulated payments with idempotency +
-> notifications**. Admin order management, the inventory API, and the frontend
+> concurrency-safe inventory, simulated payments with idempotency +
+> notifications, and **Redis catalog caching + login rate limiting with graceful
+> degradation**. Admin order management, the inventory API, and the frontend
 > come next.
 
 ---
@@ -37,24 +38,32 @@ The platform will eventually support:
 | Backend    | Node.js + Express + TypeScript            | Type-safe, huge ecosystem, easy to grow into modular monolith         |
 | Database   | MySQL 8                                   | Battle-tested relational store; enums, decimals, FK-safe transactions |
 | ORM        | Prisma                                    | Strong typed client + reviewable SQL migrations                       |
+| Cache/Rate | Redis (ioredis)                           | O(1) catalog caching, atomic login rate-limiting, fail-open fallback  |
 | Frontend   | React + TypeScript *(starts in a later stage)* | Declarative UI, strongest ecosystem for hooking up to a JSON API   |
-| Infra      | *Deliberately deferred*                   | Redis, Kafka, workers, Docker etc. arrive when they earn their place  |
+| Infra      | *Deliberately deferred*                   | Kafka, workers, Docker etc. arrive when they earn their place         |
 ## 3. Current architecture (Days 1–5)
 ## 3. Current architecture (Day 1)
 
 ```
-â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
-â”‚  Express (TypeScript)        â”‚  API layer, runs as a single process
-â”‚  â””â”€ apiRouter                â”‚    feature modules mounted as routers
-â”‚     â”œâ”€ health / auth         â”‚    GET /api/health Â· register/login/me
-│     └─ cart / orders                 │    Day 4: cart + transactional checkout
-│        payments / notifications      │    Day 5: 3-phase payment flow
-â”‚  error handling middleware   â”‚    uniform JSON errors + 404s
-â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
-               â”‚ Prisma Client
-â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
-â”‚  MySQL 8  (ecommerce_platform)â”‚  9 tables + status enums
-â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+┌──────────────────────────────┐
+│  Express (TypeScript)        │  API layer, runs as a single process
+│  └── apiRouter               │    feature modules mounted as routers
+│     ├── health / auth        │    GET /api/health · register/login/me + rate limiting
+│     ├── products             │    Day 2 & Day 6: cached catalog (detail + list)
+│     ├── cart / orders        │    Day 4: cart + transactional checkout
+│     └── payments / notifs    │    Day 5: 3-phase payment flow + notifications
+│  error handling middleware   │    uniform JSON errors + 404s
+└──────────────┬───────────────┘
+               │
+       ┌───────┴───────────────────────┐
+       ▼                               ▼
+┌──────────────┐               ┌──────────────┐
+│   Redis 8    │               │   MySQL 8    │
+│  (ioredis)   │               │ (ecommerce)  │
+│              │               │              │
+│ · catalog    │               │ · 9 tables   │
+│ · rate limit │               │ · ACID txs   │
+└──────────────┘               └──────────────┘
 ```
 
 - **Modular monolith**: one deployable backend with clearly separated modules.
@@ -82,13 +91,16 @@ ecommerce-platform/
 â”‚       â””â”€â”€ integration/      # npm test â†’ real app + real MySQL (Day 4)
 â”œâ”€â”€ database/                 # database design docs + DDL reference
 â”œâ”€â”€ frontend/                 # (starts in a later stage)
-â”œâ”€â”€ docs/
-â”‚   â”œâ”€â”€ ARCHITECTURE.md       # architecture rationale & evolution path
-â”‚   â”œâ”€â”€ AUTH.md               # authentication flows & security decisions
-â”‚   â”œâ”€â”€ PRODUCTS.md           # product catalog, pagination/search/index trade-offs
-â”‚   â”œâ”€â”€ CART.md               # cart-as-intent, uniqueness, upsert semantics
-â”‚   â””â”€â”€ ORDERS.md             # transactional checkout, locking, price snapshots
-â”œâ”€â”€ .gitignore
+├── docs/
+│   ├── ARCHITECTURE.md       # architecture rationale & evolution path
+│   ├── AUTH.md               # authentication flows & security decisions
+│   ├── PRODUCTS.md           # product catalog, pagination/search/index trade-offs
+│   ├── CART.md               # cart-as-intent, uniqueness, upsert semantics
+│   ├── ORDERS.md             # transactional checkout, locking, price snapshots
+│   ├── PAYMENTS.md           # simulated payment processing, idempotency & state machine
+│   ├── NOTIFICATIONS.md      # notifications & user scoping
+│   └── REDIS.md              # Redis catalog cache, rate limiting & fail-open resilience
+├── .gitignore
 â””â”€â”€ README.md
 ```
 

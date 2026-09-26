@@ -9,7 +9,7 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
-    "test": "node --require ./tests/register.cjs --test --test-concurrency=1 tests/integration/cart.test.ts tests/integration/orders.test.ts tests/integration/payments.test.ts",
+    "test": "node --require ./tests/register.cjs --test --test-concurrency=1 tests/integration/cart.test.ts tests/integration/orders.test.ts tests/integration/payments.test.ts tests/integration/cache.test.ts tests/integration/rateLimit.test.ts",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:studio": "prisma studio"
@@ -32,6 +32,7 @@
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "helmet": "^8.3.0",
+    "ioredis": "^5.11.1",
     "jsonwebtoken": "^9.0.3"
   },
   "devDependencies": {

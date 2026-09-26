@@ -13,10 +13,25 @@
  */
 import { AddressInfo } from 'node:net';
 import { Server } from 'node:http';
+import { setTimeout as delay } from 'node:timers/promises';
 import { createApp } from '../../src/app';
 import { prisma } from '../../src/config/prisma';
+import {
+  closeRedis,
+  getCacheStats,
+  redis,
+  resetCacheStats,
+  type CacheStats,
+} from '../../src/infrastructure/redis';
 
-/** All test-created email addresses start with this. */
+/**
+ * All test-created email addresses start with this.
+ *
+ * Day 6 note: the login rate limiter keys on (client IP + targeted account),
+ * so every test that registers its own user gets its OWN counter. The
+ * regression suites therefore keep working unchanged while the dedicated
+ * rate-limit suite can exhaust a single account's window on purpose.
+ */
 export const TEST_PREFIX = 'day4test.';
 const SKU_PREFIX = 'DAY4TEST-';
 
@@ -43,12 +58,153 @@ export async function stopTestServer(): Promise<void> {
     await new Promise<void>((resolve) => running.close(() => resolve()));
   }
   await prisma.$disconnect();
+  // Close the shared Redis socket too, otherwise the open handle keeps the
+  // test process alive after the last assertion.
+  await closeRedis();
 }
 
 export interface ApiResult<T> {
   status: number;
   body: T;
+  /** Response headers (e.g. Retry-After / X-RateLimit-* on 429s). */
+  headers: Headers;
 }
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Redis test utilities (Day 6)
+ * ─────────────────────────────────────────────────────────────────────────────
+ * The tests assert on REAL Redis state (keys, TTLs, counters), so these
+ * helpers talk to the same client the application uses. Redis is optional
+ * infrastructure for the app, but REQUIRED for the Day-6 suites - they assert
+ * it is reachable up front instead of silently passing while degraded.
+ */
+
+/** Namespaces the app writes, used for test isolation sweeps. */
+export const REDIS_TEST_PATTERNS = ['product:*', 'catalog:*', 'rate-limit:*'] as const;
+
+/** True when Redis accepts commands right now. */
+export function isRedisAvailable(): boolean {
+  return redis.status === 'ready';
+}
+
+/** Polls until the shared client is `ready` (or the timeout elapses). */
+export async function waitForRedis(timeoutMs = 10_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (isRedisAvailable()) return true;
+    await delay(100);
+  }
+  return isRedisAvailable();
+}
+
+/**
+ * Throws a helpful message when Redis is not running. Called by the Day-6
+ * suites' `before()` hooks - a Redis outage must FAIL those tests loudly, not
+ * skip them (the whole point of the suite is to verify real cache behaviour).
+ * Waits for the connection handshake first, so a slow connect is not mistaken
+ * for an outage.
+ */
+export async function requireRedis(timeoutMs = 10_000): Promise<void> {
+  if (await waitForRedis(timeoutMs)) return;
+  throw new Error(
+    'Redis is required for this test suite but is not reachable at ' +
+      `${redis.options.host}:${redis.options.port} (status="${redis.status}"). Start it with ` +
+      '`docker compose -f docker-compose.redis.yml up -d` or a local redis-server.'
+  );
+}
+
+/** Collects keys matching a pattern with SCAN (never the blocking KEYS). */
+export async function scanRedisKeys(pattern: string): Promise<string[]> {
+  if (!isRedisAvailable()) return [];
+  const keys: string[] = [];
+  await new Promise<void>((resolve, reject) => {
+    const stream = redis.scanStream({ match: pattern, count: 200 });
+    stream.on('data', (batch: string[]) => keys.push(...batch));
+    stream.on('end', () => resolve());
+    stream.on('error', reject);
+  });
+  return keys;
+}
+
+/** Deletes every key matching `pattern`; returns how many were removed. */
+export async function deleteRedisKeysMatching(pattern: string): Promise<number> {
+  const keys = await scanRedisKeys(pattern);
+  let deleted = 0;
+  for (let i = 0; i < keys.length; i += 100) {
+    deleted += await redis.del(...keys.slice(i, i + 100));
+  }
+  return deleted;
+}
+
+/**
+ * Removes all Redis state the app could have produced (cache + counters), so
+ * each suite starts from a cold cache. Also resets the in-process cache
+ * counters, which several assertions measure as deltas.
+ */
+export async function clearRedisTestState(): Promise<void> {
+  for (const pattern of REDIS_TEST_PATTERNS) {
+    await deleteRedisKeysMatching(pattern);
+  }
+  resetCacheStats();
+}
+
+/** Current value + TTL of one key (`null` when the key does not exist). */
+export async function getRedisEntry(
+  key: string
+): Promise<{ value: string; ttlSeconds: number } | null> {
+  if (!isRedisAvailable()) return null;
+  const value = await redis.get(key);
+  if (value === null) return null;
+  return { value, ttlSeconds: await redis.ttl(key) };
+}
+
+/** Parsed JSON payload of one cache key, or null when absent. */
+export async function getCachedJson<T>(key: string): Promise<T | null> {
+  const entry = await getRedisEntry(key);
+  return entry === null ? null : (JSON.parse(entry.value) as T);
+}
+
+/**
+ * Simulates a Redis outage in-process (used by the degradation tests).
+ *
+ * ioredis closes the socket asynchronously, so this waits until the client has
+ * actually left the `ready` state - otherwise the next command would still be
+ * sent on the dying socket and the test would prove nothing.
+ */
+export async function disconnectRedisForTest(timeoutMs = 3_000): Promise<void> {
+  redis.disconnect();
+  const deadline = Date.now() + timeoutMs;
+  while (isRedisAvailable() && Date.now() < deadline) {
+    await delay(10);
+  }
+}
+
+/**
+ * Restores the connection after `disconnectRedisForTest()` and waits for a real
+ * command round-trip, so later assertions cannot hit a half-open socket.
+ */
+export async function reconnectRedisForTest(timeoutMs = 5_000): Promise<void> {
+  try {
+    await redis.connect();
+  } catch {
+    // "Already connecting/connected" is fine - the ping loop below decides.
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      if ((await redis.ping()) === 'PONG') return;
+    } catch {
+      // Not usable yet; keep waiting.
+    }
+    await delay(50);
+  }
+  throw new Error('Redis did not become usable again after a simulated outage');
+}
+
+export type { CacheStats };
+export { getCacheStats, resetCacheStats };
 
 interface ApiOptions {
   token?: string;
@@ -76,6 +232,7 @@ export async function api<T = any>(
   return {
     status: response.status,
     body: (text.length > 0 ? JSON.parse(text) : null) as T,
+    headers: response.headers,
   };
 }
 
@@ -206,8 +363,14 @@ export async function getOrderCount(userId: number): Promise<number> {
 /**
  * Removes every row this suite could have created (matched by prefix), in
  * FK-safe order. Idempotent: safe to call before and after a run.
+ *
+ * Day 6: also sweeps the Redis cache/counter keys. Deleting rows directly
+ * through Prisma bypasses the API's cache invalidation, so a leftover cached
+ * product list could otherwise leak into the next test file.
  */
 export async function cleanupTestData(): Promise<void> {
+  await clearRedisTestState();
+
   const userIds = (
     await prisma.user.findMany({
       where: { email: { startsWith: TEST_PREFIX } },

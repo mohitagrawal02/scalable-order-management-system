@@ -163,6 +163,24 @@ database:
 Full flows, the ACID walkthrough, and the evolution path: [`CART.md`](./CART.md),
 [`ORDERS.md`](./ORDERS.md).
 
+
+## 5.8 Redis Caching & Rate Limiting (Day 6)
+
+In Day 6, Redis is added to accelerate read-heavy catalog traffic and protect authentication from brute-force attempts:
+
+- **Product Catalog Cache-Aside**:
+  - `product:<id>` cached on read with 60-second TTL; deleted on update/delete.
+  - `catalog:list:version` counter bumped on every catalog mutation; list query keys incorporate the version (`product:list:v<version>:<hash>`), invalidating all pagination/filter variations in O(1) time without blocking Redis with `KEYS` or scans.
+- **Login Rate Limiter**:
+  - 5 attempts per 60-second window scoped to SHA-256 hashed `(ip, account)` tuple.
+  - Evaluated via an atomic Redis Lua script (`INCR` + `EXPIRE` on first touch + `TTL`) to guarantee zero race conditions and prevent infinite key retention.
+- **Fail-Open Policy**:
+  - If Redis is down, unreachable, or times out (>500ms), errors are logged and the system fails open: catalog reads fall back to MySQL and login attempts proceed.
+  - Client configured with `enableOfflineQueue: false` and `commandTimeout: 500ms` so failures resolve in microseconds rather than blocking Node event loops.
+- **Health Check Integration**: `/api/health` reports Redis connectivity and degradation state without degrading overall service status.
+
+Full details: [`REDIS.md`](./REDIS.md).
+
 ## 6. How the architecture is expected to evolve
 
 1. **Day 2–4 (done) — features:** auth, products, cart, transactional
