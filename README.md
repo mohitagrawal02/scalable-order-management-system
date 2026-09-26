@@ -1,13 +1,14 @@
-# E-commerce & Order Management Platform
+﻿# E-commerce & Order Management Platform
 
 A **learning-oriented, production-style** e-commerce platform. Designed to grow
-from a small, well-structured application into a scalable event-driven system —
+from a small, well-structured application into a scalable event-driven system â€”
 one deliberate stage at a time.
 
-> **Status: Days 1–4 complete.** Backend foundation, MySQL schema, JWT auth,
-> admin product catalog, the shopping cart, and **transactional checkout with
-> concurrency-safe inventory**. Payments, notifications, and the frontend come
-> next.
+> **Status: Days 1â€“5 complete.** Backend foundation, MySQL schema, JWT auth,
+> admin product catalog, the shopping cart, transactional checkout with
+> concurrency-safe inventory, and **simulated payments with idempotency +
+> notifications**. Admin order management, the inventory API, and the frontend
+> come next.
 
 ---
 
@@ -38,22 +39,22 @@ The platform will eventually support:
 | ORM        | Prisma                                    | Strong typed client + reviewable SQL migrations                       |
 | Frontend   | React + TypeScript *(starts in a later stage)* | Declarative UI, strongest ecosystem for hooking up to a JSON API   |
 | Infra      | *Deliberately deferred*                   | Redis, Kafka, workers, Docker etc. arrive when they earn their place  |
-
+## 3. Current architecture (Days 1–5)
 ## 3. Current architecture (Day 1)
 
 ```
-┌──────────────────────────────┐
-│  Express (TypeScript)        │  API layer, runs as a single process
-│  └─ apiRouter                │    feature modules mounted as routers
-│     ├─ health / auth         │    GET /api/health · register/login/me
-│     ├─ products              │    admin catalog + public discovery
-│     └─ cart / orders         │    Day 4: cart + transactional checkout
-│  error handling middleware   │    uniform JSON errors + 404s
-└──────────────┬───────────────┘
-               │ Prisma Client
-┌──────────────▼───────────────┐
-│  MySQL 8  (ecommerce_platform)│  9 tables + status enums
-└──────────────────────────────┘
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+â”‚  Express (TypeScript)        â”‚  API layer, runs as a single process
+â”‚  â””â”€ apiRouter                â”‚    feature modules mounted as routers
+â”‚     â”œâ”€ health / auth         â”‚    GET /api/health Â· register/login/me
+│     └─ cart / orders                 │    Day 4: cart + transactional checkout
+│        payments / notifications      │    Day 5: 3-phase payment flow
+â”‚  error handling middleware   â”‚    uniform JSON errors + 404s
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+               â”‚ Prisma Client
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+â”‚  MySQL 8  (ecommerce_platform)â”‚  9 tables + status enums
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
 ```
 
 - **Modular monolith**: one deployable backend with clearly separated modules.
@@ -65,30 +66,30 @@ The platform will eventually support:
 
 ```
 ecommerce-platform/
-├── backend/                  # Node.js + Express + TypeScript API
-│   ├── prisma/
-│   │   ├── schema.prisma     # source of truth for the database
-│   │   └── migrations/       # applied, reviewable SQL migrations
-│   └── src/
-│       ├── config/           # env config + prisma client singleton
-│       ├── errors/           # AppError used by handlers
-│       ├── middleware/       # 404 + global error + requireAuth + requireRole
-│       ├── modules/          # feature modules (health, auth, products, cart, orders)
-│       ├── routes/           # apiRouter that mounts modules
-│       ├── app.ts            # express app factory
-│       └── server.ts         # HTTP entrypoint + graceful shutdown
-│   └── tests/
-│       └── integration/      # npm test → real app + real MySQL (Day 4)
-├── database/                 # database design docs + DDL reference
-├── frontend/                 # (starts in a later stage)
-├── docs/
-│   ├── ARCHITECTURE.md       # architecture rationale & evolution path
-│   ├── AUTH.md               # authentication flows & security decisions
-│   ├── PRODUCTS.md           # product catalog, pagination/search/index trade-offs
-│   ├── CART.md               # cart-as-intent, uniqueness, upsert semantics
-│   └── ORDERS.md             # transactional checkout, locking, price snapshots
-├── .gitignore
-└── README.md
+â”œâ”€â”€ backend/                  # Node.js + Express + TypeScript API
+â”‚   â”œâ”€â”€ prisma/
+â”‚   â”‚   â”œâ”€â”€ schema.prisma     # source of truth for the database
+â”‚   â”‚   â””â”€â”€ migrations/       # applied, reviewable SQL migrations
+â”‚   â””â”€â”€ src/
+â”‚       â”œâ”€â”€ config/           # env config + prisma client singleton
+â”‚       â”œâ”€â”€ errors/           # AppError used by handlers
+â”‚       â”œâ”€â”€ middleware/       # 404 + global error + requireAuth + requireRole
+â”‚       â”œâ”€â”€ modules/          # feature modules (health, auth, products, cart, orders)
+â”‚       â”œâ”€â”€ routes/           # apiRouter that mounts modules
+â”‚       â”œâ”€â”€ app.ts            # express app factory
+â”‚       â””â”€â”€ server.ts         # HTTP entrypoint + graceful shutdown
+â”‚   â””â”€â”€ tests/
+â”‚       â””â”€â”€ integration/      # npm test â†’ real app + real MySQL (Day 4)
+â”œâ”€â”€ database/                 # database design docs + DDL reference
+â”œâ”€â”€ frontend/                 # (starts in a later stage)
+â”œâ”€â”€ docs/
+â”‚   â”œâ”€â”€ ARCHITECTURE.md       # architecture rationale & evolution path
+â”‚   â”œâ”€â”€ AUTH.md               # authentication flows & security decisions
+â”‚   â”œâ”€â”€ PRODUCTS.md           # product catalog, pagination/search/index trade-offs
+â”‚   â”œâ”€â”€ CART.md               # cart-as-intent, uniqueness, upsert semantics
+â”‚   â””â”€â”€ ORDERS.md             # transactional checkout, locking, price snapshots
+â”œâ”€â”€ .gitignore
+â””â”€â”€ README.md
 ```
 
 ## 5. Running locally
@@ -139,7 +140,7 @@ npm run build && npm start   # compiled to dist/ (prod-style)
 
 ```bash
 curl http://localhost:4000/api/health
-# → {"status":"ok","service":"ecommerce-platform-backend","database":"up",...}
+# â†’ {"status":"ok","service":"ecommerce-platform-backend","database":"up",...}
 ```
 
 ### Useful scripts
@@ -178,7 +179,7 @@ transaction, and the security/trade-off decisions.
 | DELETE | `/api/products/:id`  | ADMIN | Delete (409 if referenced by orders/cart history)  |
 
 - Public listing shape: `{ data: [...], pagination: { page, limit, total, totalPages } }`
-- Offsetting pagination with safe caps (`limit` ≤ 100); offset-vs-cursor
+- Offsetting pagination with safe caps (`limit` â‰¤ 100); offset-vs-cursor
   trade-offs documented in [`docs/PRODUCTS.md`](./docs/PRODUCTS.md).
 - Authorization via reusable `requireRole('ADMIN')` middleware
   (401 unauthenticated / 403 wrong role; role always read from the
@@ -190,26 +191,26 @@ transaction, and the security/trade-off decisions.
 | ------ | ---------------------------- | ---- | ------------------------------------------------------------- |
 | GET    | `/api/cart`                  | JWT  | Own cart (empty cart is a valid response)                     |
 | POST   | `/api/cart/items`            | JWT  | Add product / increase existing line (upsert)                 |
-| PATCH  | `/api/cart/items/:productId` | JWT  | Set absolute quantity (0 is rejected — use DELETE)            |
+| PATCH  | `/api/cart/items/:productId` | JWT  | Set absolute quantity (0 is rejected â€” use DELETE)            |
 | DELETE | `/api/cart/items/:productId` | JWT  | Remove one line                                               |
-| POST   | `/api/orders`                | JWT  | **Checkout**: cart → order inside one transaction             |
+| POST   | `/api/orders`                | JWT  | **Checkout**: cart â†’ order inside one transaction             |
 | GET    | `/api/orders`                | JWT  | Own order history (`{ data, pagination }`)                    |
 | GET    | `/api/orders/:id`            | JWT  | Own order detail with snapshot prices (404 if not yours)      |
 
 Checkout guarantees (all verified by integration tests):
 
-- **Atomic** — order + order items + inventory decrement + cart clear happen in
+- **Atomic** â€” order + order items + inventory decrement + cart clear happen in
   one MySQL transaction; any failure rolls back *everything* (verified with a
   fault-injected mid-transaction failure: no partial order, stock untouched,
   cart intact).
-- **Concurrency-safe** — `SELECT … FOR UPDATE` row locks (cart row first, then
+- **Concurrency-safe** â€” `SELECT â€¦ FOR UPDATE` row locks (cart row first, then
   inventory rows in `product_id` order) make two customers racing for the last
-  unit produce exactly one `201` and one `409` — stock can never go negative.
-- **Price snapshots** — `OrderItem.unitPrice` freezes the purchase price; later
+  unit produce exactly one `201` and one `409` â€” stock can never go negative.
+- **Price snapshots** â€” `OrderItem.unitPrice` freezes the purchase price; later
   `Product.price` changes never rewrite history; totals are
-  `Σ(unitPrice × qty)`, computed server-side with `Decimal` (never trusted from
+  `Î£(unitPrice Ã— qty)`, computed server-side with `Decimal` (never trusted from
   the client).
-- **Ownership everywhere** — cart and order lookups are keyed by the JWT
+- **Ownership everywhere** â€” cart and order lookups are keyed by the JWT
   identity; another user's order/cart is indistinguishable from nonexistent
   (404). No `userId` is ever accepted from a request body.
 
@@ -220,7 +221,39 @@ analysis, evolution path).
 Integration tests: `cd backend && npm test` (29 tests against the real app +
 real MySQL; auto-cleanup, no seed data left behind).
 
-## 9. Current status
+## 9. Payments & Notifications API (Day 5)
+
+| Method | Path                            | Auth | Purpose                                                |
+| ------ | ------------------------------- | ---- | ------------------------------------------------------ |
+| POST   | `/api/orders/:orderId/payments` | JWT  | Charge **your** order (server-side amount, idempotent) |
+| GET    | `/api/orders/:orderId/payments` | JWT  | Read the payment for **your** order                     |
+| GET    | `/api/notifications`            | JWT  | Your notifications, newest first (`page`/`limit`)       |
+
+Payment guarantees (all verified by integration + live tests):
+
+- **Server-side amount** â€” the request body has no `amount` field; the value
+  charged and stored always equals `Order.totalAmount` (client-supplied
+  numbers are ignored).
+- **State machines** â€” `PENDING â†’ PAYMENT_PROCESSING â†’ PAID` for orders;
+  `PROCESSING â†’ SUCCEEDED | FAILED` for payments, centralized in
+  `payment.states.ts`; invalid transitions â†’ 409. A failed payment returns the
+  order to `PENDING` and can never pair `FAILED` with `PAID`.
+- **Idempotency** â€” `idempotencyKey` (required) replays the original result
+  with HTTP 200 and **no second charge** (including concurrent duplicates,
+  backed by `payments.idempotency_key UNIQUE`); `payments.order_id UNIQUE`
+  means one payment row per order, so two successes are structurally
+  impossible. Retries reuse the same row (`attemptCount++`).
+- **Provider abstraction** â€” a `PaymentProvider` interface with a
+  deterministic simulator behind it; swapping in a real PSP changes one file.
+- **Notifications** â€” `PAYMENT_SUCCEEDED` / `PAYMENT_FAILED` rows are written
+  in the *same transaction* as the payment/order state; the list endpoint is
+  keyed strictly off the JWT identity.
+
+Details: [`docs/PAYMENTS.md`](./docs/PAYMENTS.md) (three-phase flow, both
+unique constraints, retry semantics, external-provider consistency, why no
+Kafka/outbox yet) Â· [`docs/NOTIFICATIONS.md`](./docs/NOTIFICATIONS.md).
+
+## 10. Current status
 
 **Done (Day 1)**
 
@@ -235,9 +268,9 @@ real MySQL; auto-cleanup, no seed data left behind).
 
 **Done (Day 2)**
 
-- [x] `POST /api/auth/register` — validation, email normalization, bcrypt(12),
-      **User + Cart created in one transaction**, P2002→409 duplicate handling
-- [x] `POST /api/auth/login` — single query, bcrypt compare, signed JWT
+- [x] `POST /api/auth/register` â€” validation, email normalization, bcrypt(12),
+      **User + Cart created in one transaction**, P2002â†’409 duplicate handling
+- [x] `POST /api/auth/login` â€” single query, bcrypt compare, signed JWT
       (HS256, 15m, `iss`)
 - [x] `GET /api/auth/me` protected by reusable `requireAuth` middleware
 - [x] JWT config via env with fail-fast validation; `.env` git-ignored
@@ -246,49 +279,49 @@ real MySQL; auto-cleanup, no seed data left behind).
 
 **Done (Day 3)**
 
-- [x] `GET /api/products` — public, offset pagination (page/limit, `limit` ≤ 100),
+- [x] `GET /api/products` â€” public, offset pagination (page/limit, `limit` â‰¤ 100),
       `search` (name/description `contains`), `category`, `minPrice`/`maxPrice`,
       composable filters, `{ data, pagination }` envelope
-- [x] `GET /api/products/:id` — public detail, clean 400/404
-- [x] `POST /api/products` (ADMIN) — validation, SKU uniqueness → 409
-- [x] `PATCH /api/products/:id` (ADMIN) — partial updates, immutable id, 404/409
-- [x] `DELETE /api/products/:id` (ADMIN) — reference guard → clean 409 when
+- [x] `GET /api/products/:id` â€” public detail, clean 400/404
+- [x] `POST /api/products` (ADMIN) â€” validation, SKU uniqueness â†’ 409
+- [x] `PATCH /api/products/:id` (ADMIN) â€” partial updates, immutable id, 404/409
+- [x] `DELETE /api/products/:id` (ADMIN) â€” reference guard â†’ clean 409 when
       the product appears in orders or carts (order history is never cascaded)
 - [x] `requireRole('ADMIN')` middleware (401 vs 403, role from identity)
 - [x] Migration: `idx_products_price` (range-filter index, decision documented)
-- [x] `docs/PRODUCTS.md` — query design, pagination/search/index trade-offs,
+- [x] `docs/PRODUCTS.md` â€” query design, pagination/search/index trade-offs,
       authorization, system-design evolution notes
 
 **Done (Day 4)**
 
-- [x] Cart module — `GET /api/cart`, add (upsert on `UNIQUE(cart_id, product_id)`),
+- [x] Cart module â€” `GET /api/cart`, add (upsert on `UNIQUE(cart_id, product_id)`),
       update, remove; ownership from the JWT identity; backend-authoritative
       validation (400/404/409 table in `docs/CART.md`)
-- [x] Checkout — `POST /api/orders`: cart → order inside **one transaction**
+- [x] Checkout â€” `POST /api/orders`: cart â†’ order inside **one transaction**
       (order + items + inventory decrement + cart clear, or full rollback)
-- [x] Concurrency safety — `SELECT … FOR UPDATE` on the cart row, then
+- [x] Concurrency safety â€” `SELECT â€¦ FOR UPDATE` on the cart row, then
       inventory rows in `product_id` order; two checkouts racing for the last
-      unit → exactly one 201, one 409, stock never negative
-- [x] Price snapshots — `OrderItem.unitPrice` frozen at checkout; totals =
-      `Σ(unitPrice × qty)` in `Decimal`, computed server-side
+      unit â†’ exactly one 201, one 409, stock never negative
+- [x] Price snapshots â€” `OrderItem.unitPrice` frozen at checkout; totals =
+      `Î£(unitPrice Ã— qty)` in `Decimal`, computed server-side
 - [x] `GET /api/orders` (paginated summaries) and `GET /api/orders/:id`
       (detail; other users' orders 404, IDOR-safe)
 - [x] Integration test suite (`npm test`, 29 tests: cart, checkout, atomicity
       via fault injection, concurrent-checkout race) with automatic cleanup
-- [x] `docs/CART.md` + `docs/ORDERS.md` — ACID, the oversell race, snapshot
+- [x] `docs/CART.md` + `docs/ORDERS.md` â€” ACID, the oversell race, snapshot
       pricing, idempotency analysis, evolution path
-- [x] **No schema change, no new migration, no new indexes needed** — Day 1
+- [x] **No schema change, no new migration, no new indexes needed** â€” Day 1
       schema and existing indexes already covered every Day-4 query
 
-**Not done yet — deliberately**
+**Not done yet â€” deliberately**
 
-- ❌ Payment simulation, inventory reservations, notifications (Day 5)
-- ❌ Admin order management, order cancellation, refunds
-- ❌ Frontend scaffold
-- ❌ Cursor pagination, MySQL FULLTEXT / search engine (documented evolution path)
-- ❌ Idempotency keys (analysed in `docs/ORDERS.md` §9 — built with payments)
-- ❌ Refresh tokens, OAuth, password reset, email verification, login rate limiting
-- ❌ Redis, Kafka, background workers, Docker, Kubernetes, microservices
+- âŒ Payment simulation, inventory reservations, notifications (Day 5)
+- âŒ Admin order management, order cancellation, refunds
+- âŒ Frontend scaffold
+- âŒ Cursor pagination, MySQL FULLTEXT / search engine (documented evolution path)
+- âŒ Idempotency keys (analysed in `docs/ORDERS.md` Â§9 â€” built with payments)
+- âŒ Refresh tokens, OAuth, password reset, email verification, login rate limiting
+- âŒ Redis, Kafka, background workers, Docker, Kubernetes, microservices
 
 ## 10. Planned future stages
 

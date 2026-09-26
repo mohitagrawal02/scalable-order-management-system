@@ -53,11 +53,11 @@ Currently living in `backend/src/modules/`:
 | `health`   | liveness / DB connectivity reporting | Day 1       |
 | `auth`     | registration, login, JWT verification | Day 2      |
 | `products` | catalog CRUD, public discovery, filtering | Day 3  |
-| `cart`     | cart lifecycle                       | future      |
-| `orders`   | checkout, status transitions         | future      |
-| `payments` | simulated PSP interaction            | future      |
+| `cart`     | cart lifecycle                       | Day 4       |
+| `orders`   | checkout, status transitions         | Day 4       |
+| `payments` | payment flow, idempotency, state machines | Day 5   |
+| `notifications` | user-facing event notifications | Day 5       |
 | `inventory`| stock, reservations                  | future      |
-| `notifications` | user notifications             | future      |
 
 Shared infrastructure in `src/` (config, errors, middleware, routes) grows
 only when two or more modules need it. Day 2 added `middleware/requireAuth.ts`

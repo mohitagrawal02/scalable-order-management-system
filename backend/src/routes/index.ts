@@ -1,8 +1,10 @@
 import { Router } from 'express';
 import { authRouter } from '../modules/auth/auth.router';
 import { cartRouter } from '../modules/cart/cart.router';
-import { healthRouter } from '../modules/health/health.router';
+import { notificationRouter } from '../modules/notifications/notification.router';
 import { orderRouter } from '../modules/orders/order.router';
+import { paymentRouter } from '../modules/payments/payment.router';
+import { healthRouter } from '../modules/health/health.router';
 import { productRouter } from '../modules/products/product.router';
 
 /**
@@ -18,4 +20,11 @@ apiRouter.use('/health', healthRouter);
 apiRouter.use('/auth', authRouter);
 apiRouter.use('/products', productRouter);
 apiRouter.use('/cart', cartRouter);
+apiRouter.use('/notifications', notificationRouter);
+
+// Payment is a sub-resource of an order: /api/orders/:orderId/payments.
+// mergeParams on the child router makes :orderId visible to its handlers,
+// and this mount must come BEFORE the plain /orders router so the more
+// specific path wins.
+apiRouter.use('/orders/:orderId/payments', paymentRouter);
 apiRouter.use('/orders', orderRouter);

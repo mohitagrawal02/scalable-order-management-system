@@ -210,10 +210,24 @@ model Payment {
   method         PaymentMethod
   transactionRef String?       @unique @map("transaction_ref") @db.VarChar(64)
 
+  // Added in Day 5 ----------------------------------------------------------
+  // Idempotency: two identical client requests (e.g. a retry after a lost
+  // response) must collapse into ONE logical payment. The UNIQUE constraint -
+  // not a read-then-write check - is what makes that safe under concurrency,
+  // so it gets its own index for the replay lookup by key.
+  idempotencyKey String? @unique @map("idempotency_key") @db.VarChar(191)
+  // `orderId` is unique (one payment row per order), so retry history is
+  // summarized on this row instead of in a separate attempts table.
+  attemptCount  Int     @default(0) @map("attempt_count")
+  failureReason String? @map("failure_reason") @db.VarChar(255)
+
   order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
 
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
+
+  // No index on `status`: nothing queries payments by status yet. Adding one
+  // now would be speculation (see docs/ARCHITECTURE.md index policy).
 
   @@map("payments")
 }
