@@ -57,6 +57,44 @@ function readRedisUrl(): string {
 }
 
 /**
+ * Kafka is an ASYNCHRONOUS side-effect channel (Day 7), not a system of record.
+ * Like Redis, it therefore has working local defaults and is never part of the
+ * "required variables" check: the API must boot and take payments even when the
+ * broker is down - the events wait in the MySQL outbox instead.
+ * See docs/KAFKA.md §7 "What happens when Kafka is down".
+ */
+const DEFAULT_KAFKA_BROKERS = '127.0.0.1:9092';
+
+function readKafkaBrokers(): string[] {
+  const raw = process.env.KAFKA_BROKERS?.trim();
+  const value = raw === undefined || raw === '' ? DEFAULT_KAFKA_BROKERS : raw;
+  const brokers = value
+    .split(',')
+    .map((broker) => broker.trim())
+    .filter((broker) => broker.length > 0);
+
+  if (brokers.length === 0) {
+    throw new Error(`KAFKA_BROKERS must list at least one host:port. Got: "${value}"`);
+  }
+  for (const broker of brokers) {
+    if (!/^[^\s:]+:\d{1,5}$/.test(broker)) {
+      throw new Error(
+        `KAFKA_BROKERS entries must look like host:port. Got: "${broker}" in "${value}"`
+      );
+    }
+  }
+  return brokers;
+}
+
+function optionalBoolean(value: string | undefined, name: string, fallback: boolean): boolean {
+  if (value === undefined || value.trim() === '') return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'true' || normalized === '1') return true;
+  if (normalized === 'false' || normalized === '0') return false;
+  throw new Error(`Environment variable ${name} must be true/false. Got: "${value}"`);
+}
+
+/**
  * JWT secrets below 32 chars are weak. Failing here (instead of at the first
  * login request) forces a proper secret into .env.
  */
@@ -120,6 +158,73 @@ export const config = {
         60
       ),
     },
+  },
+  /**
+   * Kafka / event-driven side effects (Day 7). Everything here has a
+   * development-friendly default; production would override brokers and
+   * security settings per environment and never commit credentials.
+   */
+  kafka: {
+    /** Master switch. `false` turns the producer and consumers off entirely. */
+    enabled: optionalBoolean(process.env.KAFKA_ENABLED, 'KAFKA_ENABLED', true),
+    brokers: readKafkaBrokers(),
+    /** Identifies this process in broker logs / quotas. */
+    clientId: process.env.KAFKA_CLIENT_ID?.trim() || 'ecommerce-platform-backend',
+    /** Consumer group for the notification worker (see docs/KAFKA.md §5). */
+    notificationGroupId: process.env.KAFKA_NOTIFICATION_GROUP_ID?.trim() || 'notification-service',
+    /**
+     * How many times a consumer retries ONE message before dead-lettering it.
+     * Transient failures (DB blip) recover inside these attempts; a poison
+     * message must not stall the partition forever.
+     */
+    consumerMaxAttempts: optionalPositiveInt(
+      process.env.KAFKA_CONSUMER_MAX_ATTEMPTS,
+      'KAFKA_CONSUMER_MAX_ATTEMPTS',
+      3
+    ),
+    consumerRetryDelayMs: optionalPositiveInt(
+      process.env.KAFKA_CONSUMER_RETRY_DELAY_MS,
+      'KAFKA_CONSUMER_RETRY_DELAY_MS',
+      250
+    ),
+    outbox: {
+      /**
+       * Attempts before a stuck outbox row is parked as DEAD. This is a much
+       * larger budget than the consumer's: a broker outage is expected and
+       * recoverable, so events simply wait rather than being given up on.
+       */
+      maxAttempts: optionalPositiveInt(
+        process.env.KAFKA_OUTBOX_MAX_ATTEMPTS,
+        'KAFKA_OUTBOX_MAX_ATTEMPTS',
+        10
+      ),
+      /** How often the background dispatcher looks for pending events. */
+      dispatchIntervalMs: optionalPositiveInt(
+        process.env.KAFKA_OUTBOX_DISPATCH_INTERVAL_MS,
+        'KAFKA_OUTBOX_DISPATCH_INTERVAL_MS',
+        2_000
+      ),
+      /** Events published per dispatch round (keeps each tick bounded). */
+      batchSize: optionalPositiveInt(
+        process.env.KAFKA_OUTBOX_BATCH_SIZE,
+        'KAFKA_OUTBOX_BATCH_SIZE',
+        50
+      ),
+    },
+    /**
+     * Client-side timeouts. A publish must never sit on a dead socket for
+     * minutes; the event is retried from the outbox instead.
+     */
+    connectionTimeoutMs: optionalPositiveInt(
+      process.env.KAFKA_CONNECTION_TIMEOUT_MS,
+      'KAFKA_CONNECTION_TIMEOUT_MS',
+      3_000
+    ),
+    requestTimeoutMs: optionalPositiveInt(
+      process.env.KAFKA_REQUEST_TIMEOUT_MS,
+      'KAFKA_REQUEST_TIMEOUT_MS',
+      5_000
+    ),
   },
 } as const;
 

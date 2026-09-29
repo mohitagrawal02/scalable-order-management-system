@@ -2,9 +2,11 @@ import { Order, Payment, Prisma } from '@prisma/client';
 import { prisma } from '../../config/prisma';
 import { AppError } from '../../errors/AppError';
 import {
-  createPaymentFailedNotification,
-  createPaymentSucceededNotification,
-} from '../notifications/notification.service';
+  buildOrderPaidEvent,
+  buildPaymentFailedEvent,
+  enqueueOutboxEvent,
+  scheduleOutboxDispatch,
+} from '../../infrastructure/kafka';
 import { assertOrderTransition, assertPaymentTransition } from './payment.states';
 import type {
   CreatePaymentInput,
@@ -44,12 +46,34 @@ export type { PaymentResponse } from './payment.types';
  *                    transaction; if it throws we treat the attempt as a
  *                    failure with a safe reason.
  *   Phase C (tx 2):  persist the outcome atomically - payment state, order
- *                    state and the notification commit TOGETHER (each update
- *                    is compare-and-swap guarded by the expected status, so a
+ *                    state and the OUTBOX EVENT commit TOGETHER (each update is
+ *                    compare-and-swap guarded by the expected status, so a
  *                    surprise state change rolls the whole thing back).
  *
  * The observable invariant: you can never see SUCCEEDED payment paired with a
  * non-PAID order, because both writes happen in one transaction.
+ *
+ * DAY 7: THE NOTIFICATION LEFT THE TRANSACTION
+ * --------------------------------------------
+ * Day 5 wrote the notification row inside Phase C. Day 7 replaces that with an
+ * outbox row (still inside Phase C, so it is atomic) and lets a Kafka consumer
+ * create the notification afterwards:
+ *
+ *   Phase C:  payment → SUCCEEDED, order → PAID, outbox row inserted  (all ACID)
+ *   after:    dispatcher publishes OrderPaid  →  notification consumer writes
+ *
+ * Why inside the transaction and not after it: "commit to MySQL, then publish to
+ * Kafka" is a dual write, and the gap between the two lines is where events get
+ * silently lost (broker down) or invented (rollback after publish). The outbox
+ * removes the gap by making the intent to publish part of the same commit. See
+ * docs/KAFKA.md §6.
+ *
+ * Consequences, stated plainly:
+ *   - the API response is FASTER (no notification write, no broker round trip);
+ *   - notifications are EVENTUALLY consistent - they appear shortly after the
+ *     response, not during it;
+ *   - payment correctness is unchanged: it still lives entirely in this file's
+ *     transactions. Kafka is never in the critical path.
  *
  * KNOWN LIMITATION (documented, not solved today): a crash between Phase A and
  * Phase C leaves payment=PROCESSING / order=PAYMENT_PROCESSING until a future
@@ -241,8 +265,9 @@ export async function createPayment(
   }
 
   // ------- Phase C: persist the outcome atomically ------------------------
-  // payment + order + notification commit TOGETHER. The observable invariant:
-  // you can never see SUCCEEDED payment paired with a non-PAID order.
+  // payment + order + OUTBOX EVENT commit TOGETHER. The observable invariant:
+  // you can never see SUCCEEDED payment paired with a non-PAID order, and you
+  // can never see a PAID order whose OrderPaid event was never recorded.
   const saved = await prisma.$transaction(async (tx) => {
     if (charge.outcome === 'SUCCESS') {
       assertPaymentTransition('PROCESSING', 'SUCCEEDED');
@@ -260,11 +285,24 @@ export async function createPayment(
         where: { id: phaseA.order.id },
         data: { status: 'PAID' },
       });
-      await createPaymentSucceededNotification(tx, {
-        userId,
-        orderId: order.id,
-        orderNumber: order.orderNumber,
-      });
+
+      // The event is recorded IN THIS TRANSACTION (the outbox pattern), so it
+      // is committed exactly when the payment is. Publishing happens after this
+      // transaction returns - the notification is now a side effect that cannot
+      // delay or fail the payment.
+      await enqueueOutboxEvent(
+        tx,
+        buildOrderPaidEvent({
+          paymentId: payment.id,
+          orderId: order.id,
+          orderNumber: order.orderNumber,
+          userId,
+          totalAmount: payment.amount.toFixed(2),
+          currency: CURRENCY,
+          method: payment.method,
+          paidAt: payment.updatedAt,
+        })
+      );
       return { payment, order };
     }
 
@@ -282,14 +320,32 @@ export async function createPayment(
       where: { id: phaseA.order.id },
       data: { status: 'PENDING' },
     });
-    await createPaymentFailedNotification(tx, {
-      userId,
-      orderId: order.id,
-      orderNumber: order.orderNumber,
-      reason,
-    });
+
+    await enqueueOutboxEvent(
+      tx,
+      buildPaymentFailedEvent({
+        paymentId: payment.id,
+        orderId: order.id,
+        orderNumber: order.orderNumber,
+        userId,
+        amount: payment.amount.toFixed(2),
+        currency: CURRENCY,
+        method: payment.method,
+        reason,
+        attemptCount: payment.attemptCount,
+        orderStatus: order.status,
+        failedAt: payment.updatedAt,
+      })
+    );
     return { payment, order };
   }, TX_OPTIONS);
+
+  // ------- After the commit: hand the event to Kafka, best effort ---------
+  // Deliberately not awaited. The event is already durable in the outbox, so
+  // the response does not depend on the broker; if this call is skipped or the
+  // broker is down, the background dispatcher publishes it on its next tick
+  // (and keeps retrying). Ordering matters here: COMMIT FIRST, PUBLISH SECOND.
+  scheduleOutboxDispatch();
 
   return {
     payment: toPaymentResponse(saved.payment),

@@ -262,3 +262,75 @@ model Notification {
   @@index([userId, createdAt], map: "idx_notifications_user_created")
   @@map("notifications")
 }
+
+// ----------------------------------------------------------------------------
+// Day 7: event-driven side effects (outbox + consumer idempotency)
+// ----------------------------------------------------------------------------
+// These two tables are INFRASTRUCTURE, not domain: they make the MySQL → Kafka
+// hand-off reliable. Both are deliberately FK-free (no `orderId`/`paymentId`
+// columns) so a stuck or dead-lettered event can never block deleting the
+// business row it talks about, and so this table does not grow a second,
+// competing copy of the domain model.
+
+enum OutboxEventStatus {
+  /// Committed with the business transaction, not yet accepted by Kafka.
+  PENDING
+  /// Acknowledged by the broker (at-least-once: a duplicate publish is allowed
+  /// and is exactly what consumer idempotency exists to absorb).
+  PUBLISHED
+  /// Gave up after `attempts` tries. Kept for inspection/ops, no longer retried.
+  DEAD
+}
+
+/// Transactional outbox: the row is written by the SAME transaction that
+/// changes business state, which removes the dual-write problem (see
+/// docs/KAFKA.md §6). The full event envelope is stored as-is so publishing is
+/// a straight read → serialize → send, with no reconstruction step that could
+/// drift from what the producer originally meant.
+model OutboxEvent {
+  id            Int              @id @default(autoincrement())
+  /// UUIDv4. Carried in the envelope and used by consumers for deduplication.
+  eventId       String           @unique @map("event_id") @db.VarChar(36)
+  topic         String           @db.VarChar(120)
+  eventType     String           @map("event_type") @db.VarChar(80)
+  aggregateType String           @map("aggregate_type") @db.VarChar(40)
+  aggregateId   String           @map("aggregate_id") @db.VarChar(64)
+  /// Kafka message key: everything for one aggregate must keep its order.
+  partitionKey  String           @map("partition_key") @db.VarChar(64)
+  /// The complete serialized event envelope.
+  envelope      Json
+  status        OutboxEventStatus @default(PENDING)
+  attempts      Int              @default(0)
+  lastError     String?          @map("last_error") @db.VarChar(500)
+  occurredAt    DateTime         @map("occurred_at")
+  publishedAt   DateTime?        @map("published_at")
+  createdAt     DateTime         @default(now()) @map("created_at")
+
+  /// The dispatcher's only query: "oldest still-pending events, in id order".
+  /// `id` is included so the scan is covered by this index instead of sorting.
+  @@index([status, id], map: "idx_outbox_status_id")
+  @@map("outbox_events")
+}
+
+/// Consumer-side deduplication ledger.
+///
+/// Kafka guarantees at-least-once delivery, so a consumer WILL eventually see
+/// the same event twice (rebalance, retry after a partially-applied batch, a
+/// duplicate outbox publish). The unique constraint on
+/// (consumer_group, event_id) is what turns "at-least-once delivery" into
+/// "effectively-once effect": the second delivery hits a duplicate-key error
+/// and is skipped.
+model ProcessedEvent {
+  id            Int      @id @default(autoincrement())
+  /// Scopes the ledger per group, so two independent consumers may each
+  /// legitimately process the same event.
+  consumerGroup String   @map("consumer_group") @db.VarChar(80)
+  eventId       String   @map("event_id") @db.VarChar(36)
+  eventType     String   @map("event_type") @db.VarChar(80)
+  processedAt   DateTime @default(now()) @map("processed_at")
+
+  @@unique([consumerGroup, eventId], map: "uq_processed_events_group_event")
+  /// Supports the retention sweep that keeps this ledger from growing forever.
+  @@index([processedAt], map: "idx_processed_events_processed_at")
+  @@map("processed_events")
+}

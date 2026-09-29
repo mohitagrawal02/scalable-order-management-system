@@ -40,34 +40,40 @@ The platform will eventually support:
 | ORM        | Prisma                                    | Strong typed client + reviewable SQL migrations                       |
 | Cache/Rate | Redis (ioredis)                           | O(1) catalog caching, atomic login rate-limiting, fail-open fallback  |
 | Frontend   | React + TypeScript *(starts in a later stage)* | Declarative UI, strongest ecosystem for hooking up to a JSON API   |
-| Infra      | *Deliberately deferred*                   | Kafka, workers, Docker etc. arrive when they earn their place         |
-## 3. Current architecture (Days 1–5)
-## 3. Current architecture (Day 1)
+| Infra      | Kafka 3 (KRaft) + transactional outbox    | Async side effects off the request path; Docker still deferred   |
+## 3. Current architecture (Days 1-7)
 
 ```
-┌──────────────────────────────┐
-│  Express (TypeScript)        │  API layer, runs as a single process
-│  └── apiRouter               │    feature modules mounted as routers
-│     ├── health / auth        │    GET /api/health · register/login/me + rate limiting
-│     ├── products             │    Day 2 & Day 6: cached catalog (detail + list)
-│     ├── cart / orders        │    Day 4: cart + transactional checkout
-│     └── payments / notifs    │    Day 5: 3-phase payment flow + notifications
-│  error handling middleware   │    uniform JSON errors + 404s
-└──────────────┬───────────────┘
-               │
-       ┌───────┴───────────────────────┐
-       ▼                               ▼
-┌──────────────┐               ┌──────────────┐
-│   Redis 8    │               │   MySQL 8    │
-│  (ioredis)   │               │ (ecommerce)  │
-│              │               │              │
-│ · catalog    │               │ · 9 tables   │
-│ · rate limit │               │ · ACID txs   │
-└──────────────┘               └──────────────┘
++--------------------------+          +--------------------------+
+|  API process             |          |  Worker process          |
+|  npm run dev             |          |  npm run worker          |
+|                          |          |                          |
+|  Express (TypeScript)    |          |  + outbox dispatcher     |
+|   +-- apiRouter          |          |    PENDING -> PUBLISHED  |
+|      +-- health / auth   |          |  + notification consumer |
+|      +-- products        |          |    events -> notifications
+|      +-- cart / orders   |          |    (+ dedup + DLQ)       |
+|      +-- payments        |          |                          |
+|   +-- error handling     |          |  same modules, same DB   |
++------------+-------------+          +-------------+------------+
+             |                                       |
+             |      +------------+      +------------v-----------+
+             +----->|  MySQL 8   |<-----|  Kafka 3 (KRaft)       |
+                    | 11 tables  |      |  order.events    (7d)  |
+                    | outbox     |      |  payment.events  (7d)  |
+                    | processed  |      |  *.dlq           (30d) |
+                    +------------+      +------------------------+
+             |
+        +----v----+
+        | Redis 8 |   Day 6: catalog cache + login rate limit
+        +---------+
 ```
 
 - **Modular monolith**: one deployable backend with clearly separated modules.
   No microservices yet (see `docs/ARCHITECTURE.md`).
+- The API and the worker are two entrypoints into the SAME codebase. Kafka only
+  carries asynchronous side effects and never sits on the request path; its
+  status never changes the health endpoint's overall status (see `docs/KAFKA.md`).
 - Schema in `backend/prisma/schema.prisma`, applied via reviewable SQL
   migrations in `backend/prisma/migrations/`.
 
@@ -82,15 +88,18 @@ ecommerce-platform/
 â”‚   â””â”€â”€ src/
 â”‚       â”œâ”€â”€ config/           # env config + prisma client singleton
 â”‚       â”œâ”€â”€ errors/           # AppError used by handlers
+â”‚       â”œâ”€â”€ infrastructure/   # redis/ and kafka/ (outbox, producer, consumer)
 â”‚       â”œâ”€â”€ middleware/       # 404 + global error + requireAuth + requireRole
 â”‚       â”œâ”€â”€ modules/          # feature modules (health, auth, products, cart, orders)
 â”‚       â”œâ”€â”€ routes/           # apiRouter that mounts modules
 â”‚       â”œâ”€â”€ app.ts            # express app factory
 â”‚       â””â”€â”€ server.ts         # HTTP entrypoint + graceful shutdown
+â”‚       â””â”€â”€ worker.ts         # Day 7 entrypoint: dispatcher + consumer
 â”‚   â””â”€â”€ tests/
-â”‚       â””â”€â”€ integration/      # npm test â†’ real app + real MySQL (Day 4)
+â”‚       â””â”€â”€ integration/      # npm test â†’ real app + real MySQL (Days 4-7)
 â”œâ”€â”€ database/                 # database design docs + DDL reference
 â”œâ”€â”€ frontend/                 # (starts in a later stage)
+â”œâ”€â”€ infra/kafka/            # local KRaft broker + scripts (no Docker)
 ├── docs/
 │   ├── ARCHITECTURE.md       # architecture rationale & evolution path
 │   ├── AUTH.md               # authentication flows & security decisions
@@ -100,6 +109,7 @@ ecommerce-platform/
 │   ├── PAYMENTS.md           # simulated payment processing, idempotency & state machine
 │   ├── NOTIFICATIONS.md      # notifications & user scoping
 │   └── REDIS.md              # Redis catalog cache, rate limiting & fail-open resilience
+│   └── KAFKA.md              # outbox, at-least-once delivery, consumer idempotency
 ├── .gitignore
 â””â”€â”€ README.md
 ```
@@ -148,7 +158,23 @@ npm run dev              # ts-node-dev with auto-restart (dev)
 npm run build && npm start   # compiled to dist/ (prod-style)
 ```
 
-### 5. Verify
+### 5. Start Kafka and the worker (Day 7)
+
+Notifications are produced asynchronously: the payment commits an event to the
+MySQL **transactional outbox**, the worker publishes it to Kafka, and the
+notification consumer writes the notification. The API alone still serves every
+request - with no broker (or `KAFKA_ENABLED=false`) events simply wait in
+`outbox_events` until Kafka is available.
+
+```bash
+npm run kafka:start     # format once, then launch the local KRaft broker
+npm run kafka:status    # broker up? port listening?
+npm run worker          # outbox dispatcher + notification consumer
+```
+
+Startup order: **MySQL -> Kafka broker -> API -> worker**.
+
+### 6. Verify
 
 ```bash
 curl http://localhost:4000/api/health
@@ -167,6 +193,11 @@ curl http://localhost:4000/api/health
 | `npm run prisma:generate` | (re)generate the Prisma client       |
 | `npm run prisma:migrate`  | create & apply a new migration        |
 | `npm run prisma:studio`   | browser-based DB explorer             |
+| `npm run worker`      | outbox dispatcher + notification consumer   |
+| `npm run kafka:start` | start the local KRaft Kafka broker          |
+| `npm run kafka:stop`  | stop the Kafka broker                       |
+| `npm run kafka:status`| broker health + port check                  |
+| `npm run kafka:topics`| list topics                                 |
 
 ## 6. Authentication API (Day 2)
 
@@ -233,7 +264,7 @@ analysis, evolution path).
 Integration tests: `cd backend && npm test` (29 tests against the real app +
 real MySQL; auto-cleanup, no seed data left behind).
 
-## 9. Payments & Notifications API (Day 5)
+## 9. Payments & Notifications API (Days 5 & 7)
 
 | Method | Path                            | Auth | Purpose                                                |
 | ------ | ------------------------------- | ---- | ------------------------------------------------------ |
@@ -257,13 +288,18 @@ Payment guarantees (all verified by integration + live tests):
   impossible. Retries reuse the same row (`attemptCount++`).
 - **Provider abstraction** â€” a `PaymentProvider` interface with a
   deterministic simulator behind it; swapping in a real PSP changes one file.
-- **Notifications** â€” `PAYMENT_SUCCEEDED` / `PAYMENT_FAILED` rows are written
-  in the *same transaction* as the payment/order state; the list endpoint is
+- **Notifications** ... `PAYMENT_SUCCEEDED` / `PAYMENT_FAILED` are **not** written
+  by the payment transaction any more. The payment commits an outbox event
+  instead and the notification appears once the worker has consumed it, so it is
+  eventually consistent by a few milliseconds - in exchange a slow notification
+  path can no longer slow down or fail a payment. The list endpoint is still
   keyed strictly off the JWT identity.
 
 Details: [`docs/PAYMENTS.md`](./docs/PAYMENTS.md) (three-phase flow, both
-unique constraints, retry semantics, external-provider consistency, why no
-Kafka/outbox yet) Â· [`docs/NOTIFICATIONS.md`](./docs/NOTIFICATIONS.md).
+unique constraints, retry semantics, external-provider consistency) ..
+[`docs/NOTIFICATIONS.md`](./docs/NOTIFICATIONS.md) ..
+[`docs/KAFKA.md`](./docs/KAFKA.md) (transactional outbox, at-least-once
+delivery, consumer idempotency, dead-letter queues).
 
 ## 10. Current status
 
@@ -325,24 +361,59 @@ Kafka/outbox yet) Â· [`docs/NOTIFICATIONS.md`](./docs/NOTIFICATIONS.md).
 - [x] **No schema change, no new migration, no new indexes needed** â€” Day 1
       schema and existing indexes already covered every Day-4 query
 
+**Done (Day 5)**
+
+- [x] Three-phase payment flow (PENDING ... PROCESSING ... SUCCEEDED/FAILED),
+      server-side amount (the body has no `amount` field), `idempotencyKey`
+      replay with no second charge, one payment row per order
+- [x] `PaymentProvider` interface behind a deterministic simulator
+- [x] Notifications (`PAYMENT_SUCCEEDED` / `PAYMENT_FAILED`) with ownership
+      taken from the JWT identity, not from a query string
+- [x] `docs/PAYMENTS.md` + `docs/NOTIFICATIONS.md`
+
+**Done (Day 6)**
+
+- [x] Redis catalog cache ... cache-aside, version-bump invalidation, TTL fallback
+- [x] Fixed-window login rate limiter (atomic Lua, keyed on IP + account)
+- [x] Fail-open degradation ... a Redis outage degrades performance, never requests
+- [x] `GET /api/health` reports Redis without letting it decide the status
+- [x] `docs/REDIS.md`
+
+**Done (Day 7)**
+
+- [x] Transactional outbox ... `outbox_events` committed in the SAME transaction
+      as the payment; publish-first / mark-second dispatcher; `DEAD` after the
+      retry budget; no claim or lock taken before publishing
+- [x] Kafka 3 (KRaft, local, no Docker) with declared topics + `ensureTopics()`;
+      `infra/kafka/kafka.ps1` + `npm run kafka:*`
+- [x] Event envelope + `OrderPaid` / `PaymentFailed`; partition key `order-<id>`
+      so one order's payment events can never be reordered
+- [x] At-least-once consumer ... manual commits, `processed_events` dedup written
+      in the same transaction as the notification, permanent failures (and only
+      those) go straight to the DLQ
+- [x] Second entrypoint `src/worker.ts` (`npm run worker`): outbox dispatcher +
+      notification consumer, running the same modules as the API
+- [x] `GET /api/health` ... `kafka.pendingEvents` / `kafka.deadEvents`, with
+      Kafka never deciding the overall status
+- [x] `docs/KAFKA.md`
+
 **Not done yet â€” deliberately**
 
-- âŒ Payment simulation, inventory reservations, notifications (Day 5)
 - âŒ Admin order management, order cancellation, refunds
 - âŒ Frontend scaffold
 - âŒ Cursor pagination, MySQL FULLTEXT / search engine (documented evolution path)
 - âŒ Idempotency keys (analysed in `docs/ORDERS.md` Â§9 â€” built with payments)
-- âŒ Refresh tokens, OAuth, password reset, email verification, login rate limiting
-- âŒ Redis, Kafka, background workers, Docker, Kubernetes, microservices
+- ... Refresh tokens, OAuth, password reset, email verification
+- ... Docker, Kubernetes, microservices (Kafka + the background worker are done)
 
-## 10. Planned future stages
+## 11. Planned future stages
 
 | Stage | Scope |
 | ----- | ----- |
 | 4 | ~~Cart + orders + transactional order creation~~ **done (Day 4)** |
-| 5 | Simulated payments, inventory reservations, order status transitions, notifications |
-| 6 | Caching (Redis), background workers, rate limiting |
-| 7 | Events (Kafka), observability, containerization (Docker), CI |
+| 5 | ~~Simulated payments, inventory reservations, order status transitions, notifications~~ **done (Day 5)** |
+| 6 | ~~Caching (Redis), background workers, rate limiting~~ **done (Day 6)** |
+| 7 | ~~Events (Kafka)~~ **done (Day 7)**, observability, containerization (Docker), CI |
 
 Exact scope may change as we learn; the rule stays: **only add what solves a
 real problem we have actually hit**.

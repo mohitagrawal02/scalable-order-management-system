@@ -1,4 +1,4 @@
-# Notifications (Day 5)
+# Notifications (Days 5 & 7)
 
 ## 1. API
 
@@ -33,7 +33,7 @@ path** that accepts a `userId` from the body or query string — a
 `?userId=<someone-else>` parameter is simply ignored, so one user can never
 list another user's notifications. Unauthenticated access → **401**.
 
-## 3. Creation: written inside the payment transaction
+## 3. Creation: the consumer writes it, not the payment transaction
 
 `notification.service.ts` exposes two creators that take a Prisma **transaction
 client** (`tx`) as their first argument:
@@ -41,14 +41,22 @@ client** (`tx`) as their first argument:
 - `createPaymentSucceededNotification(tx, …)` → type `PAYMENT_SUCCEEDED`
 - `createPaymentFailedNotification(tx, …)` → type `PAYMENT_FAILED`
 
-The payment service calls them in **Phase C**, the same transaction that
-writes the final payment status and order status. Consequences:
+The **notification consumer** (`notification.consumer.ts`, Day 7) calls them.
+A payment no longer writes a notification at all: it commits an `OrderPaid` /
+`PaymentFailed` event to `outbox_events` **in the same transaction** as the
+payment and order state, and the worker publishes that event to Kafka so this
+consumer can turn it into a notification (see `docs/KAFKA.md`).
 
-- a notification exists **iff** the state change it describes was committed —
-  no notification for a rolled-back payment, and no payment without its
-  notification;
-- the read path (`listNotifications`) is a plain query — notifications are
-  never "sent" anywhere yet.
+Consequences:
+
+- a notification exists **iff** its event was consumed - no notification for a
+  payment that was never committed (the outbox row rolls back with it), and no
+  notification silently lost (a failing handler is retried, then dead-lettered);
+- the write is **idempotent**: a `processed_events` marker keyed on
+  `(consumer_group, event_id)` is inserted in the SAME transaction as the
+  notification, so at-least-once delivery can never produce two rows;
+- the read path (`listNotifications`) is unchanged - notifications are still
+  never "sent" anywhere.
 
 Types come from the existing `NotificationType` enum
 (`ORDER_CONFIRMED, PAYMENT_SUCCEEDED, PAYMENT_FAILED, ORDER_SHIPPED,
@@ -57,13 +65,24 @@ order-lifecycle types are simply unused until later stages. `orderId` links
 the notification to its order (`ON DELETE SET NULL`), and the response
 embeds a small order summary when that link exists.
 
-## 4. Why synchronous (and when this changes)
+## 4. Why asynchronous now (Day 7)
 
-Right now the fan-out is exactly one row in the same transaction — an
-outbox/queue would be pure overhead. **The future architecture:** when
-notifications become email/SMS/push (slow, fallible external work), Phase C will
-write the notification *intent* (or an outbox row) transactionally, and a
-**background worker** will consume it and call the delivery channels —
-retries with backoff, dead-lettering, and no impact on payment latency. That
-is the Day-6+ worker milestone; the creation API and ownership rules above
+Day 5 wrote the notification inside the payment transaction and documented why:
+the fan-out was one row, so an outbox/queue would have been pure overhead.
+**Day 7 paid that cost deliberately**, for three reasons:
+
+- the notification path is no longer inside the transaction the customer is
+  waiting for, so it can never slow down or fail a payment;
+- the same event now feeds any number of future consumers (email, analytics,
+  search, webhooks) without touching the payment code;
+- the pattern is the lesson: the outbox, at-least-once delivery, consumer
+  idempotency and the dead-letter queue are the machinery every asynchronous
+  side effect needs.
+
+What it costs: notifications are **eventually consistent** - a few milliseconds
+behind the response in normal operation, and longer while the broker is down,
+because the events simply wait in `outbox_events`. The creation API and the
+ownership rules above are unchanged.
+
+Full detail: [`docs/KAFKA.md`](./KAFKA.md).
 stay unchanged.

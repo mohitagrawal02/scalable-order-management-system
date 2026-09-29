@@ -1,0 +1,13 @@
+# ============================================================================
+# Line endings
+# ============================================================================
+# Prisma records a SHA256 of each migration file's bytes in _prisma_migrations.
+# The checksum is computed over LF, so a CRLF checkout on Windows silently
+# invalidates every recorded checksum and `prisma migrate dev` then refuses to
+# run ("migration was modified after it was applied") and asks for a database
+# reset. Forcing LF for migration SQL prevents that at the source.
+backend/prisma/migrations/** text eol=lf
+
+# Shell/PowerShell scripts are also safer with explicit endings.
+*.ps1 text eol=crlf
+*.sh  text eol=lf

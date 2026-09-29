@@ -6,13 +6,18 @@
   "main": "dist/server.js",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "worker": "ts-node-dev --respawn --transpile-only src/worker.ts",
     "build": "tsc",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
-    "test": "node --require ./tests/register.cjs --test --test-concurrency=1 tests/integration/cart.test.ts tests/integration/orders.test.ts tests/integration/payments.test.ts tests/integration/cache.test.ts tests/integration/rateLimit.test.ts",
+    "test": "node --require ./tests/register.cjs --test --test-concurrency=1 tests/integration/cart.test.ts tests/integration/orders.test.ts tests/integration/payments.test.ts tests/integration/outbox.test.ts tests/integration/cache.test.ts tests/integration/rateLimit.test.ts tests/integration/kafka.test.ts",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
-    "prisma:studio": "prisma studio"
+    "prisma:studio": "prisma studio",
+    "kafka:start": "powershell -NoProfile -ExecutionPolicy Bypass -File ..\\infra\\kafka\\kafka.ps1 -Action start",
+    "kafka:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File ..\\infra\\kafka\\kafka.ps1 -Action stop",
+    "kafka:status": "powershell -NoProfile -ExecutionPolicy Bypass -File ..\\infra\\kafka\\kafka.ps1 -Action status",
+    "kafka:topics": "powershell -NoProfile -ExecutionPolicy Bypass -File ..\\infra\\kafka\\kafka.ps1 -Action topics"
   },
   "engines": {
     "node": ">=18"
@@ -33,7 +38,8 @@
     "express": "^5.2.1",
     "helmet": "^8.3.0",
     "ioredis": "^5.11.1",
-    "jsonwebtoken": "^9.0.3"
+    "jsonwebtoken": "^9.0.3",
+    "kafkajs": "^2.2.4"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",

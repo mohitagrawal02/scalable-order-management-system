@@ -1,9 +1,15 @@
 /**
- * Payment API integration tests (Day 5).
+ * Payment API integration tests (Day 5, updated Day 7).
  *
  * Real HTTP against the real Express app + MySQL. Covers: success/failure,
  * server-side amount trust boundary, ownership, state machines, idempotency
  * (sequential + concurrent), retry semantics, and DB uniqueness constraints.
+ *
+ * Day 7 change: notifications are no longer written by the payment transaction.
+ * The payment commits an OUTBOX EVENT instead, and the notification only exists
+ * once the worker's two stages have run. The tests below drive those stages
+ * in-process (`deliverOutboxEvents`) so the assertions stay deterministic and
+ * do not need a broker - see the Kafka test utilities in ./helpers.ts.
  */
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
@@ -12,6 +18,7 @@ import {
   api,
   cleanupTestData,
   createProduct,
+  deliverOutboxEvents,
   registerAdmin,
   registerUser,
   startTestServer,
@@ -346,9 +353,54 @@ describe('Payments API (Day 5)', () => {
   });
 
   // --------------------------------------------------------- notifications
+  it('payment enqueues an outbox event and does NOT notify synchronously', async () => {
+    const order = await checkout(customer, product.id, 1);
+    await pay(customer.token, order.id, { idempotencyKey: key('outbox-async') });
+
+    // (1) The payment transaction committed the intent to publish...
+    const rows = await prisma.outboxEvent.findMany({
+      where: { partitionKey: `order-${order.id}` },
+    });
+    assert.equal(rows.length, 1, 'exactly one outbox row was committed with the payment');
+    assert.equal(rows[0].eventType, 'OrderPaid');
+    assert.equal(rows[0].topic, 'order.events');
+    assert.equal(rows[0].attempts >= 0, true);
+    assert.notEqual(rows[0].status, 'DEAD', 'a fresh event is never dead-lettered');
+
+    // (2) ...and NOTHING has written the notification yet. The test server runs
+    // no consumer, so if this passed on Day 5 terms the transaction would have
+    // written it directly - which is exactly the coupling Day 7 removed.
+    const before = await api<{ data: Array<{ type: string; order: { id: number } | null }> }>(
+      'GET',
+      '/api/notifications?limit=100',
+      { token: customer.token }
+    );
+    assert.equal(
+      before.body.data.some((n) => n.type === 'PAYMENT_SUCCEEDED' && n.order?.id === order.id),
+      false,
+      'no notification exists before the worker runs'
+    );
+
+    // (3) The worker's two stages are all it takes.
+    assert.equal(await deliverOutboxEvents([order.id]), 1, 'one event handed to the consumer');
+
+    const after = await api<{ data: Array<{ type: string; order: { id: number } | null }> }>(
+      'GET',
+      '/api/notifications?limit=100',
+      { token: customer.token }
+    );
+    assert.ok(
+      after.body.data.find((n) => n.type === 'PAYMENT_SUCCEEDED' && n.order?.id === order.id),
+      'notification appears once the outbox event is consumed'
+    );
+  });
+
   it('successful payment creates a PAYMENT_SUCCEEDED notification for the owner', async () => {
     const order = await checkout(customer, product.id, 1);
     await pay(customer.token, order.id, { idempotencyKey: key('notif-ok') });
+
+    // Day 7: the notification is produced asynchronously - drive the worker.
+    await deliverOutboxEvents([order.id]);
 
     const notifs = await api<{
       data: Array<{ type: string; message: string; order: { id: number } | null }>;
@@ -368,13 +420,17 @@ describe('Payments API (Day 5)', () => {
       simulation: { outcome: 'FAILURE' },
     });
 
+    // Day 7: the notification is produced asynchronously - drive the worker.
+    await deliverOutboxEvents([order.id]);
+
     const notifs = await api<{
-      data: Array<{ type: string; order: { id: number } | null }>;
+      data: Array<{ type: string; message: string; order: { id: number } | null }>;
     }>('GET', '/api/notifications?limit=100', { token: customer.token });
     const hit = notifs.body.data.find(
       (n) => n.type === 'PAYMENT_FAILED' && n.order?.id === order.id
     );
     assert.ok(hit, 'PAYMENT_FAILED notification referencing the order exists');
+    assert.match(hit!.message, /Payment failed for order/);
   });
 
   it('notification list is scoped to the JWT identity (other users invisible)', async () => {

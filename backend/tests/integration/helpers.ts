@@ -23,6 +23,21 @@ import {
   resetCacheStats,
   type CacheStats,
 } from '../../src/infrastructure/redis';
+import {
+  brokerSummary,
+  closeKafkaAdmin,
+  disconnectProducer,
+  dispatchOutbox,
+  envelopeHeaders,
+  kafkaEnabled,
+  pingKafka,
+  type ConsumedEvent,
+  type EventEnvelope,
+  type OutboxDispatchResult,
+  type PublishInput,
+  type Publisher,
+} from '../../src/infrastructure/kafka';
+import { handleDomainEvent } from '../../src/modules/notifications/notification.consumer';
 
 /**
  * All test-created email addresses start with this.
@@ -58,6 +73,11 @@ export async function stopTestServer(): Promise<void> {
     await new Promise<void>((resolve) => running.close(() => resolve()));
   }
   await prisma.$disconnect();
+  // Day 7: release the Kafka sockets too. An open producer/admin connection
+  // would keep the event loop alive after the last assertion, so the runner
+  // would sit waiting for a process that has nothing left to do.
+  await disconnectProducer();
+  await closeKafkaAdmin().catch(() => undefined);
   // Close the shared Redis socket too, otherwise the open handle keeps the
   // test process alive after the last assertion.
   await closeRedis();
@@ -205,6 +225,147 @@ export async function reconnectRedisForTest(timeoutMs = 5_000): Promise<void> {
 
 export type { CacheStats };
 export { getCacheStats, resetCacheStats };
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Kafka test utilities (Day 7)
+ * ─────────────────────────────────────────────────────────────────────────────
+ * The Day-7 suites must NOT need a running broker. Two seams already exist in
+ * the production code for exactly this and are used here instead of mocking:
+ *
+ *   - `dispatchOutbox({ publisher })` accepts an injected transport, so the
+ *     whole PENDING → PUBLISHED path can be exercised with a fake;
+ *   - `handleDomainEvent()` is exported from the notification consumer so the
+ *     consumer side can be invoked with the same code path the worker uses.
+ *
+ * What is NOT simulated is the broker round-trip itself - that is what the live
+ * `kafka.test.ts` suite (guarded by `requireKafka`) is for.
+ */
+
+/** Transport that records what the dispatcher would have sent. Never fails. */
+export class RecordingPublisher implements Publisher {
+  readonly published: PublishInput[] = [];
+
+  /** Set to make the next publish(s) throw - used by the failure paths. */
+  failWith: string | null = null;
+
+  async publish(input: PublishInput): Promise<void> {
+    if (this.failWith) throw new Error(this.failWith);
+    this.published.push(input);
+  }
+}
+
+/**
+ * One dispatch round against a recording transport.
+ *
+ * Returns both so a test can assert the transport AND the database row.
+ * The dispatcher refuses to run concurrently with itself (`inFlight`), and a
+ * payment's fire-and-forget dispatch can hold that guard for as long as a real
+ * broker round-trip takes. So when a round reports `skipped` this waits and
+ * tries again - otherwise the caller would assert against a round that never
+ * ran.
+ */
+export async function dispatchWithRecording(
+  options: { limit?: number; failWith?: string; retries?: number } = {}
+): Promise<{ publisher: RecordingPublisher; result: OutboxDispatchResult }> {
+  const publisher = new RecordingPublisher();
+  if (options.failWith) publisher.failWith = options.failWith;
+
+  const retries = options.retries ?? 5;
+  let result = await dispatchOutbox({ publisher, limit: options.limit });
+  for (let attempt = 0; result.skipped && attempt < retries; attempt += 1) {
+    await delay(100);
+    result = await dispatchOutbox({ publisher, limit: options.limit });
+  }
+  return { publisher, result };
+}
+
+/** Rebuilds the `ConsumedEvent` shape from a stored outbox row. */
+function rowToConsumedEvent(row: {
+  id: number;
+  topic: string;
+  partitionKey: string;
+  envelope: unknown;
+}): ConsumedEvent {
+  const envelope = row.envelope as EventEnvelope;
+  return {
+    topic: row.topic,
+    partition: 0,
+    // A synthetic offset: the test never reads it, but a handler might, so the
+    // field must exist rather than being `undefined`.
+    offset: String(row.id),
+    key: row.partitionKey,
+    headers: envelopeHeaders(envelope),
+    envelope,
+    attempt: 1,
+  };
+}
+
+/**
+ * Drives the ASYNC half of a payment to completion, in-process.
+ *
+ * Day 5 asserted "pay → notification exists" because both happened in one
+ * transaction. Day 7 splits them: the payment commits an outbox row, the
+ * dispatcher publishes it, and the notification consumer writes the
+ * notification. This helper plays the worker's two stages so the assertion can
+ * stay a single call:
+ *
+ *   1. `dispatchOutbox` against a recording transport (publishes whatever is
+ *      still PENDING - a no-op for rows a real dispatcher already took);
+ *   2. feed every outbox row for these orders to `handleDomainEvent`.
+ *
+ * Step 2 reads the row regardless of its status on purpose: step 1 is only
+ * there to exercise the dispatcher, while the CONSUMER must not depend on how
+ * the row got published (that independence is the point of the outbox).
+ * Deliveries are idempotent, so calling this twice creates one notification.
+ *
+ * @param orderIds orders whose events should be delivered (matched on the
+ *        partition key `order-<id>`, which is what keeps them ordered).
+ * @returns how many outbox rows were handed to the consumer.
+ */
+export async function deliverOutboxEvents(orderIds: number[]): Promise<number> {
+  await dispatchWithRecording().catch(() => undefined);
+
+  const rows = await prisma.outboxEvent.findMany({
+    where: { partitionKey: { in: orderIds.map((id) => `order-${id}`) } },
+    orderBy: { id: 'asc' },
+  });
+
+  for (const row of rows) {
+    await handleDomainEvent(rowToConsumedEvent(row));
+  }
+  return rows.length;
+}
+
+/** Removes specific outbox rows (and their dedup markers) by event id. */
+export async function deleteOutboxRows(eventIds: string[]): Promise<void> {
+  if (eventIds.length === 0) return;
+  await prisma.processedEvent.deleteMany({ where: { eventId: { in: eventIds } } });
+  await prisma.outboxEvent.deleteMany({ where: { eventId: { in: eventIds } } });
+}
+
+/**
+ * Throws when Kafka is not usable. Called by the live suite's `before()` hook -
+ * a broker outage must FAIL those tests loudly, not skip them (the suite exists
+ * to verify real broker behaviour). Mirrors `requireRedis()`.
+ */
+export async function requireKafka(timeoutMs = 15_000): Promise<void> {
+  if (!kafkaEnabled()) {
+    throw new Error(
+      'Kafka is disabled (KAFKA_ENABLED=false). Set KAFKA_ENABLED=true to run the live Kafka suite.'
+    );
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await pingKafka()) return;
+    await delay(250);
+  }
+  throw new Error(
+    `Kafka is required for this test suite but the broker did not answer within ${timeoutMs}ms ` +
+      `(${brokerSummary()}). Start it with \`..\\infra\\kafka\\kafka.ps1 -Action start\`.`
+  );
+}
 
 interface ApiOptions {
   token?: string;
@@ -394,6 +555,16 @@ export async function cleanupTestData(): Promise<void> {
     ).map((o) => o.id);
 
     if (orderIds.length > 0) {
+      // Day 7: outbox rows and their dedup markers are tied to these orders by
+      // the partition key (`order-<id>`). They must be swept together - an
+      // outbox row left behind for a deleted order would still be dispatched,
+      // and a `processed_events` marker left behind is pure dead weight.
+      const outboxRows = await prisma.outboxEvent.findMany({
+        where: { partitionKey: { in: orderIds.map((id) => `order-${id}`) } },
+        select: { eventId: true },
+      });
+      await deleteOutboxRows(outboxRows.map((row) => row.eventId));
+
       // Ordering matters: notifications/payments reference orders, order_items
       // reference products with ON DELETE RESTRICT, so orders are removed first.
       await prisma.notification.deleteMany({ where: { userId: { in: userIds } } });

@@ -88,7 +88,7 @@ is split, and each phase states its guarantee:
 | ----- | ---------- | ------------ | --------- |
 | A | **yes** | `SELECT … FOR UPDATE` on the order row → ownership → state machine → idempotency lookup → write payment `PROCESSING` + order `PAYMENT_PROCESSING` | Concurrent attempts for one order are serialized; unique constraints are the safety net |
 | B | no | `provider.charge(amount = Order.totalAmount)` | Provider lives outside our transaction; a throw = treated as failure |
-| C | **yes** | payment final state + order final state + notification commit **together** | You can never observe `SUCCEEDED` payment with a non-`PAID` order |
+| C | **yes** | payment final state + order final state + the `OrderPaid`/`PaymentFailed` **outbox** row, commit **together** (Day 7) | You can never observe a `SUCCEEDED` payment with a non-`PAID` order, and never a committed payment without its event |
 
 **Known limitation (documented, accepted today):** a crash between Phase A and
 Phase C leaves `payment=PROCESSING / order=PAYMENT_PROCESSING` until a future
@@ -125,17 +125,28 @@ Application-level handling on top of the constraints:
   re-charge. To actually retry, the client issues a **new** key — this mirrors
   how Stripe treats idempotency keys per attempt.
 
-## 8. Why no Kafka/outbox yet
+## 8. Kafka and the transactional outbox (added in Day 7)
 
-Today a payment is a single synchronous request/response inside one process —
-an event bus would add infrastructure without removing any real complexity.
-There is no second consumer of "payment succeeded" data yet: the notification
-is written in the same transaction, and order history is a direct query.
-**The trigger to introduce an outbox + Kafka:** a second service (analytics,
-shipping, ledger) must react to `PaymentSucceeded`, or notifications become
-email/SMS fan-out that shouldn't slow the payment response. Then Phase C
-writes an `outbox` row in the same transaction and a relay publishes it —
-at-least-once delivery, consumers idempotent by `payment.id`.
+Day 5 deliberately had no event bus: a payment was one synchronous
+request/response, the notification was written in the same transaction, and
+there was no second consumer of "payment succeeded" data. The trigger written
+down then was: *"a second service must react to `PaymentSucceeded`, or
+notifications become fan-out that shouldn't slow the payment response."*
+
+**Day 7 pulled that trigger.** Phase C now writes an `outbox_events` row in the
+same transaction as the payment and order state, and a background dispatcher
+publishes it to Kafka afterwards:
+
+- an event can no longer be lost when the broker is down (it waits in MySQL and
+  is retried), and it can no longer be published for a transaction that rolled
+  back - the dual-write problem is closed by construction;
+- delivery is at-least-once, so the notification consumer deduplicates on
+  `event_id` via `processed_events` (same transaction as the notification);
+- the notification is now written by that consumer, not by Phase C - see
+  `docs/NOTIFICATIONS.md` sections 3-4.
+
+Full detail, including the dual-write analysis and what happens when the broker
+is down: [`docs/KAFKA.md`](./KAFKA.md).
 
 ## 9. Real providers: what's deliberately deferred
 
@@ -152,7 +163,7 @@ Invariants the tables encode:
 - an order reaches `PAID` **only** via `PAYMENT_PROCESSING`, i.e. only after a
   provider-verified success — never directly from a client request;
 - a `FAILED` payment never marks the order `PAID` (failure writes
-  `payment=FAILED` + `order=PENDING` + a notification in **one** transaction);
+  `payment=FAILED` + `order=PENDING` + its outbox event in **one** transaction);
 - `SUCCEEDED`/`PAID` are terminal for Day 5: no `PAID → PAID`, no recharging a
   succeeded payment, no `PAID → PAYMENT_PROCESSING`.
 

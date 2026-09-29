@@ -29,3 +29,13 @@ Thumbs.db
 
 # MySQL local data dir (used on machines where the MySQL service is unavailable)
 mysql-local-data/
+
+# Local Kafka broker artifacts (broker data/logs live outside the repo by
+# default, but KAFKA_DATA_DIR can point back into it)
+infra/kafka/data/
+infra/kafka/logs/
+
+# Leftover from a mis-parsed shell command: a file whose name contains newlines.
+# It is locked by the OneDrive client and cannot be deleted while sync holds it,
+# so it is ignored here rather than risking it being committed by `git add .`.
+/ersmohit*
