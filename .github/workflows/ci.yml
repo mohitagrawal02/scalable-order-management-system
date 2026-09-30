@@ -1,0 +1,295 @@
+# ============================================================================
+# CI: three jobs, each answering a different question
+# ============================================================================
+#   static              is the code well-typed and the schema valid?
+#   integration-tests   do the 108 tests pass against REAL MySQL/Redis/Kafka?
+#   docker              does the image build, and does the whole Compose stack
+#                       actually boot, serve traffic and shut down politely?
+#
+# The `docker` job is not a bonus. This project is developed on a machine with no
+# Docker installed, so nothing between writing backend/Dockerfile and a deploy
+# would ever touch it. An untested Dockerfile is a broken Dockerfile that has not
+# been caught yet, and this job is where it gets caught.
+# ============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege: this workflow reads the repository and runs containers. It
+# never needs to write to git or to a registry.
+permissions:
+  contents: read
+
+# A new push to the same branch cancels the older run: CI minutes are a budget,
+# and a run of a commit nobody is going to merge tells us nothing.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+
+jobs:
+  # --------------------------------------------------------------------------
+  # static: the cheapest possible gate in front of everything else
+  # --------------------------------------------------------------------------
+  static:
+    name: Type-check and schema validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies from the lockfile
+        # `npm ci`, never `npm install`: the lockfile is the build's input, and a
+        # pipeline that resolves versions at run time cannot reproduce a failure.
+        run: npm ci
+
+      - name: Validate prisma/schema.prisma
+        # `validate` reads datasource.url but never connects, so a dummy URL is
+        # enough. A schema typo should cost 30 seconds here, not a rollback.
+        env:
+          DATABASE_URL: mysql://ci:ci@127.0.0.1:3306/ci_validation
+        run: npx prisma validate
+
+      - name: Generate the client and type-check
+        # There is no ESLint config in this repository yet, so the compiler IS the
+        # linter: strict mode, noUnusedLocals, noUnusedParameters,
+        # noImplicitReturns. Adding a real lint step is listed under "next" in
+        # docs/DEPLOYMENT.md rather than being silently skipped.
+        run: |
+          npx prisma generate
+          npm run typecheck
+
+  # --------------------------------------------------------------------------
+  # integration-tests: the real suite against the real dependencies
+  # --------------------------------------------------------------------------
+  integration-tests:
+    name: Integration tests (MySQL + Redis + Kafka)
+    needs: static
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: backend
+    # The credentials below are literal, and that is the honest choice: this
+    # database exists for one job, is reachable only from this runner, and dies
+    # with it. Putting a production-shaped secret here would only create a way to
+    # leak one.
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ci_root_only
+          MYSQL_DATABASE: ecommerce_platform
+          MYSQL_USER: ecommerce_app
+          MYSQL_PASSWORD: ci_app_only
+        ports:
+          - 3306:3306
+        # The same TCP-ping healthcheck as docker-compose.yml, for the same
+        # reason: during first boot the image serves on a socket with networking
+        # off, so this only goes green when the real server is up.
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci_root_only --silent"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=20
+          --health-start-period=30s
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=10
+
+    env:
+      DATABASE_URL: mysql://ecommerce_app:ci_app_only@127.0.0.1:3306/ecommerce_platform
+      REDIS_URL: redis://127.0.0.1:6379
+      KAFKA_BROKERS: localhost:9092
+      # Long enough for config/index.ts, and deliberately NOT containing any of
+      # the placeholder strings it rejects. It signs tokens that outlive this job
+      # by nothing at all.
+      JWT_SECRET: ci-only-signing-material-never-used-anywhere-real
+      NODE_ENV: test
+      LOG_LEVEL: error
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - run: npm ci
+
+      - run: npx prisma generate
+
+      - name: Start a single-node KRaft broker
+        # The same image and the same KRaft shape as docker-compose.yml. Kafka is
+        # a `docker run` here rather than a `services:` entry because the address
+        # it advertises has to be the CLIENT's address: here the client is a
+        # process on the runner host, so `localhost:9092` is the only answer that
+        # works, and saying so explicitly is what makes CI and local dev agree.
+        run: |
+          docker run -d --name ci-kafka \
+            -p 9092:9092 -p 9093:9093 \
+            -e KAFKA_NODE_ID=1 \
+            -e KAFKA_PROCESS_ROLES=broker,controller \
+            -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+            -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+            -e KAFKA_LISTENERS=CONTROLLER://:9093,PLAINTEXT://:9092 \
+            -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
+            -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+            -e KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT \
+            -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+            -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
+            -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+            -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+            -e KAFKA_NUM_PARTITIONS=1 \
+            -e CLUSTER_ID=6M7h4pQiU-aNVdL--Y97ty \
+            apache/kafka:4.0.2
+
+      - name: Wait until the broker answers
+        # tests/integration/helpers.ts SKIPS the Kafka suite when no broker
+        # answers - right on a laptop, wrong for CI, where a silently skipped
+        # group would be reported as a pass. Reachability is therefore proven
+        # here, loudly, before a single test runs.
+        run: |
+          for i in $(seq 1 60); do
+            if docker exec ci-kafka /opt/kafka/bin/kafka-broker-api-versions.sh \
+                 --bootstrap-server localhost:9092 >/dev/null 2>&1; then
+              echo "broker answered after ${i} attempt(s)"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Kafka never became ready - the Kafka tests would be skipped, not passed"
+          docker logs ci-kafka
+          exit 1
+
+      - name: Apply the migrations that ship with the code
+        # `migrate deploy`, exactly like the Compose `migrate` service: CI proves
+        # the committed SQL applies to an empty database in order, which is the
+        # one thing `migrate dev` on a laptop never proves.
+        run: npx prisma migrate deploy
+
+      - name: Run the integration suite
+        run: npm test
+
+      - name: Dump broker logs when the suite failed
+        if: failure()
+        run: docker logs ci-kafka
+
+  # --------------------------------------------------------------------------
+  # docker: build the image, boot the stack, prove it serves and stops politely
+  # --------------------------------------------------------------------------
+  docker:
+    name: Image build + Compose smoke test
+    needs: static
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      # docker-compose.yml declares ${JWT_SECRET:?...} with no default, so this
+      # is required - and it satisfies config/index.ts's production rules too,
+      # because the stack boots with NODE_ENV=production and those checks run for
+      # real (a placeholder secret here would fail the boot, not just review).
+      JWT_SECRET: ci-only-signing-material-never-used-anywhere-real
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the runtime image
+        # Catches a bad COPY path, a missing generated Prisma client, an
+        # entrypoint that cannot parse - every failure mode that is invisible on a
+        # machine with no Docker installed.
+        run: docker build --target runtime --tag ecommerce-platform-backend:ci backend
+
+      - name: Build the migrate target as well
+        # A build target that nobody builds is a build target that is broken.
+        run: docker build --target migrate --tag ecommerce-platform-migrate:ci backend
+
+      - name: Start the stack and wait for the probes
+        # `--wait` blocks on the healthchecks in docker-compose.yml, so a service
+        # that starts and then wedges fails the job instead of passing it. The
+        # one-shot `migrate` service runs in front of the app services: if the
+        # committed migrations do not apply, nothing downstream is allowed to boot.
+        run: docker compose up -d --build --wait
+
+      - name: Probe the operational endpoints
+        # /live answers without any I/O, /ready has just proven it can reach
+        # MySQL, /metrics is the counter payload a deploy would scrape.
+        run: |
+          set -euo pipefail
+          curl -fsS http://127.0.0.1:4000/api/health/live
+          curl -fsS http://127.0.0.1:4000/api/health/ready
+          curl -fsS http://127.0.0.1:4000/api/metrics
+
+      - name: Smoke-test a real request path
+        # register -> login -> catalog, through the bytes we would actually
+        # deploy. This is the step that proves the image can resolve `mysql` and
+        # `redis` by service name, run a transaction, and answer in the API's own
+        # envelope - none of which a container-state check can tell you.
+        run: |
+          set -euo pipefail
+          EMAIL="ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}@example.com"
+          PAYLOAD="{\"email\":\"${EMAIL}\",\"password\":\"CiOnlyPassw0rd\",\"name\":\"CI Smoke Test\"}"
+          curl -fsS -o /dev/null -X POST http://127.0.0.1:4000/api/auth/register \
+            -H 'content-type: application/json' -d "$PAYLOAD"
+          TOKEN=$(curl -fsS -X POST http://127.0.0.1:4000/api/auth/login \
+            -H 'content-type: application/json' -d "$PAYLOAD" | jq -r '.token')
+          test -n "$TOKEN"
+          test "$TOKEN" != "null"
+          curl -fsS http://127.0.0.1:4000/api/products | jq -e '.data | type == "array"' >/dev/null
+          curl -fsS http://127.0.0.1:4000/api/products | jq -e '.pagination.total >= 0' >/dev/null
+
+      - name: The worker started and joined its consumer group
+        # The worker has no probe (it opens no port), so its liveness signal in CI
+        # is the log line it writes after connecting to Kafka and starting the
+        # dispatcher - and a crash loop would never reach it.
+        run: docker compose logs --no-color worker | grep -q '"message":"ready"'
+
+      - name: SIGTERM produces a clean, ordered shutdown
+        # The Day 8 contract, asserted in the environment where it matters.
+        # Exit code 0 means tini forwarded SIGTERM, the named steps ran, and the
+        # process chose to leave. 137 would mean Docker had to escalate to
+        # SIGKILL - the signature of SHUTDOWN_TIMEOUT_MS and stop_grace_period
+        # falling out of agreement, which is otherwise invisible in the logs
+        # because the process that would have written them was killed.
+        run: |
+          set -euo pipefail
+          docker compose stop -t 20 api
+          API_ID=$(docker compose ps -q api)
+          EXIT_CODE=$(docker inspect -f '{{ .State.ExitCode }}' "$API_ID")
+          echo "api container exit code: $EXIT_CODE"
+          test "$EXIT_CODE" = "0"
+          docker compose logs --no-color api | grep -q '"message":"shutdown complete"'
+
+      - name: Show the whole stack's logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+
+      - name: Tear the stack down
+        if: always()
+        run: docker compose down -v --remove-orphans
+
+

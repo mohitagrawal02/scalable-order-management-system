@@ -1,0 +1,42 @@
+# ============================================================================
+# What never enters the build context
+# ============================================================================
+# The build context is the whole backend folder, sent to the daemon before the
+# first instruction runs. Two of these lines are not about speed:
+#
+#   node_modules   a tree installed on Windows carries a WINDOWS Prisma query
+#                  engine and Windows-shaped paths. Copying it into a Linux
+#                  image is the classic broken Node+Prisma build; `npm ci`
+#                  inside the image is the whole point of the Dockerfile.
+#   .env           a secret must never be in an image - and not only because of
+#                  the registry copy: build contexts and layer caches outlive
+#                  the file by months. Compose passes real env vars instead.
+#
+# Everything else is here because it is not needed to produce dist/ + the
+# generated Prisma client (the build only ever reads src/, prisma/, tsconfig.json
+# and the two package manifests), and a smaller context means a faster build.
+# ============================================================================
+
+node_modules
+dist
+.env
+.env.local
+.env.*.local
+
+# Tests are compiled by tsconfig.test.json, never by the build config (rootDir
+# is ./src), so they cannot affect the artifact - and leaving them out means a
+# stray test fixture can never end up in a deployed image.
+tests
+coverage
+
+*.tsbuildinfo
+*.log
+npm-debug.log*
+scratch/
+*.tmp
+
+.git
+.gitignore
+.vscode
+README.md
+tsconfig.test.json

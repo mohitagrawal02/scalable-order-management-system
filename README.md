@@ -1,16 +1,18 @@
 ﻿# E-commerce & Order Management Platform
 
 A **learning-oriented, production-style** e-commerce platform. Designed to grow
-from a small, well-structured application into a scalable event-driven system â€”
+from a small, well-structured application into a scalable event-driven system —
 one deliberate stage at a time.
 
-> **Status: Days 1–8 complete.** Backend foundation, MySQL schema, JWT auth,
+> **Status: Days 1–9 complete.** Backend foundation, MySQL schema, JWT auth,
 > admin product catalog, the shopping cart, transactional checkout with
 > concurrency-safe inventory, simulated payments with idempotency +
-> notifications, **Kafka events through a transactional outbox**, and
-> **observability: structured logs with request correlation, route-pattern
-> metrics, liveness/readiness probes and graceful shutdown**. Admin order
-> management, the inventory API, Docker/CI and the frontend come next.
+> notifications, **Kafka events through a transactional outbox**,
+> **observability: correlated logs, route-pattern metrics, probes and graceful
+> shutdown**, and **delivery: one multi-stage image that is both the API and the
+> worker, a Compose stack that boots the entire system, and a CI pipeline that
+> builds that image and runs it**. Admin order management, the inventory API and
+> the frontend come next.
 
 ---
 
@@ -41,7 +43,8 @@ The platform will eventually support:
 | ORM        | Prisma                                    | Strong typed client + reviewable SQL migrations                       |
 | Cache/Rate | Redis (ioredis)                           | O(1) catalog caching, atomic login rate-limiting, fail-open fallback  |
 | Frontend   | React + TypeScript *(starts in a later stage)* | Declarative UI, strongest ecosystem for hooking up to a JSON API   |
-| Infra      | Kafka 3 (KRaft) + transactional outbox    | Async side effects off the request path; Docker still deferred   |
+| Infra      | Kafka 3 (KRaft) + transactional outbox    | Async side effects off the request path                        |
+| Delivery   | Docker (multi-stage, non-root, tini) · Compose · GitHub Actions | One image for both process roles; CI boots the stack it builds, so the Dockerfile cannot rot |
 | Ops        | Structured logs, request ids, in-process metrics, liveness/readiness, graceful shutdown | Be observable and deployable without adding a metrics stack |
 ## 3. Current architecture (Days 1-8)
 
@@ -89,25 +92,30 @@ The platform will eventually support:
 
 ```
 ecommerce-platform/
-â”œâ”€â”€ backend/                  # Node.js + Express + TypeScript API
-â”‚   â”œâ”€â”€ prisma/
-â”‚   â”‚   â”œâ”€â”€ schema.prisma     # source of truth for the database
-â”‚   â”‚   â””â”€â”€ migrations/       # applied, reviewable SQL migrations
-â”‚   â””â”€â”€ src/
-â”‚       â”œâ”€â”€ config/           # env config + prisma client singleton
-â”‚       â”œâ”€â”€ errors/           # AppError used by handlers
-â”‚       â”œâ”€â”€ infrastructure/   # redis/ and kafka/ (outbox, producer, consumer)
-â”‚       â”œâ”€â”€ middleware/       # 404 + global error + requireAuth + requireRole
-â”‚       â”œâ”€â”€ modules/          # feature modules (health, auth, products, cart, orders)
-â”‚       â”œâ”€â”€ routes/           # apiRouter that mounts modules
-â”‚       â”œâ”€â”€ app.ts            # express app factory
-â”‚       â””â”€â”€ server.ts         # HTTP entrypoint + graceful shutdown
-â”‚       â””â”€â”€ worker.ts         # Day 7 entrypoint: dispatcher + consumer
-â”‚   â””â”€â”€ tests/
-â”‚       â””â”€â”€ integration/      # npm test â†’ real app + real MySQL (Days 4-7)
-â”œâ”€â”€ database/                 # database design docs + DDL reference
-â”œâ”€â”€ frontend/                 # (starts in a later stage)
-â”œâ”€â”€ infra/kafka/            # local KRaft broker + scripts (no Docker)
+├── backend/                  # Node.js + Express + TypeScript API
+│   ├── prisma/
+│   │   ├── schema.prisma     # source of truth for the database
+│   │   └── migrations/       # applied, reviewable SQL migrations
+│   └── src/
+│       ├── config/           # env config + prisma client singleton
+│       ├── errors/           # AppError used by handlers
+│       ├── infrastructure/   # redis/ and kafka/ (outbox, producer, consumer)
+│       ├── middleware/       # 404 + global error + requireAuth + requireRole
+│       ├── modules/          # feature modules (health, auth, products, cart, orders)
+│       ├── routes/           # apiRouter that mounts modules
+│       ├── app.ts            # express app factory
+│       └── server.ts         # HTTP entrypoint + graceful shutdown
+│       └── worker.ts         # Day 7 entrypoint: dispatcher + consumer
+│   ├── Dockerfile            # Day 9: one build, two targets (runtime, migrate)
+│   ├── .dockerignore         # keeps node_modules + .env out of the build context
+│   └── tests/
+│       └── integration/      # npm test → real app + real MySQL (Days 4-7)
+├── database/                 # database design docs + DDL reference
+├── frontend/                 # (starts in a later stage)
+├── infra/kafka/              # host-run KRaft broker (the no-Docker path)
+├── docker-compose.yml        # Day 9: mysql + redis + kafka + migrate + api + worker
+├── .env.example              # Compose variables (only JWT_SECRET is mandatory)
+├── .github/workflows/ci.yml  # type-check → integration tests → build + boot stack
 ├── docs/
 │   ├── ARCHITECTURE.md       # architecture rationale & evolution path
 │   ├── AUTH.md               # authentication flows & security decisions
@@ -118,12 +126,58 @@ ecommerce-platform/
 │   ├── NOTIFICATIONS.md      # notifications & user scoping
 │   ├── REDIS.md              # Redis catalog cache, rate limiting & fail-open resilience
 │   ├── KAFKA.md              # outbox, at-least-once delivery, consumer idempotency
-│   └── RELIABILITY.md        # structured logs, request ids, metrics, probes, shutdown
+│   ├── RELIABILITY.md        # structured logs, request ids, metrics, probes, shutdown
+│   └── DEPLOYMENT.md         # Day 9: containers, the local stack, what CI proves
 ├── .gitignore
-â””â”€â”€ README.md
+└── README.md
 ```
 
 ## 5. Running locally
+
+Two ways, chosen by whether you want Docker to own the dependencies:
+
+| Path | What you get | Needs |
+| ---- | ------------ | ----- |
+| **5a. Containers** | MySQL, Redis, Kafka, migrations, API and worker from one `up` command | Docker |
+| **5b. Host** | The Days 1–8 path: `npm run dev` against a local MySQL, Redis/Kafka optional | Node + MySQL |
+
+### 5a. The whole stack in containers (Day 9)
+
+```bash
+copy .env.example .env            # only JWT_SECRET is mandatory
+docker compose up -d --build
+curl http://localhost:4000/api/health/ready
+curl http://localhost:4000/api/metrics
+docker compose logs -f worker     # "ready" once it joins its consumer group
+docker compose stop api           # watch the Day 8 shutdown steps run, exit 0
+docker compose down               # add -v to drop the MySQL/Kafka volumes
+```
+
+| Service | Host address | Notes |
+| ------- | ------------ | ----- |
+| api | `http://localhost:4000` | `/api/health/live`, `/api/health/ready`, `/api/metrics` |
+| worker | — | the **same image** as the api; its `command:` points at `dist/worker.js` |
+| mysql | `127.0.0.1:3308` | 3308, so it coexists with a local mysqld on 3306/3307 |
+| redis | `127.0.0.1:6380` | for poking at the cache; containers use `redis:6379` |
+| kafka | `127.0.0.1:29092` | host listener; containers use `kafka:9092` |
+
+Inside the network, connection strings use **service names** (`mysql`, `redis`,
+`kafka`) — `localhost` there is the container itself, which is why this stack's
+`DATABASE_URL` is a different string from `backend/.env`'s on purpose. The
+one-shot `migrate` service applies the committed SQL before either app container
+starts, and `stop_grace_period` is deliberately larger than `SHUTDOWN_TIMEOUT_MS`
+so `SIGTERM` is not a race the platform wins.
+
+> **Honesty note:** this project is developed on a machine with **no Docker
+> installed**. The image and the stack are therefore built and booted by CI
+> (`.github/workflows/ci.yml`, `docker` job) — which is also what stops them
+> rotting. `docs/DEPLOYMENT.md` §9 states exactly what was verified where.
+
+### 5b. On the host (the path used in Days 1–8)
+
+Everything below is unchanged: `npm run dev` against a local MySQL, with Redis
+and Kafka optional (fail-open cache, outbox-queued events) and the host-run
+broker script in `infra/kafka/`.
 
 ### Prerequisites
 
@@ -187,7 +241,7 @@ Startup order: **MySQL -> Kafka broker -> API -> worker**.
 
 ```bash
 curl http://localhost:4000/api/health
-# â†’ {"status":"ok","service":"ecommerce-platform-backend","database":"up",...}
+# → {"status":"ok","service":"ecommerce-platform-backend","database":"up",...}
 ```
 
 Probes and counters (Day 8):
@@ -242,7 +296,7 @@ transaction, and the security/trade-off decisions.
 | DELETE | `/api/products/:id`  | ADMIN | Delete (409 if referenced by orders/cart history)  |
 
 - Public listing shape: `{ data: [...], pagination: { page, limit, total, totalPages } }`
-- Offsetting pagination with safe caps (`limit` â‰¤ 100); offset-vs-cursor
+- Offsetting pagination with safe caps (`limit` ≤ 100); offset-vs-cursor
   trade-offs documented in [`docs/PRODUCTS.md`](./docs/PRODUCTS.md).
 - Authorization via reusable `requireRole('ADMIN')` middleware
   (401 unauthenticated / 403 wrong role; role always read from the
@@ -254,26 +308,26 @@ transaction, and the security/trade-off decisions.
 | ------ | ---------------------------- | ---- | ------------------------------------------------------------- |
 | GET    | `/api/cart`                  | JWT  | Own cart (empty cart is a valid response)                     |
 | POST   | `/api/cart/items`            | JWT  | Add product / increase existing line (upsert)                 |
-| PATCH  | `/api/cart/items/:productId` | JWT  | Set absolute quantity (0 is rejected â€” use DELETE)            |
+| PATCH  | `/api/cart/items/:productId` | JWT  | Set absolute quantity (0 is rejected — use DELETE)            |
 | DELETE | `/api/cart/items/:productId` | JWT  | Remove one line                                               |
-| POST   | `/api/orders`                | JWT  | **Checkout**: cart â†’ order inside one transaction             |
+| POST   | `/api/orders`                | JWT  | **Checkout**: cart → order inside one transaction             |
 | GET    | `/api/orders`                | JWT  | Own order history (`{ data, pagination }`)                    |
 | GET    | `/api/orders/:id`            | JWT  | Own order detail with snapshot prices (404 if not yours)      |
 
 Checkout guarantees (all verified by integration tests):
 
-- **Atomic** â€” order + order items + inventory decrement + cart clear happen in
+- **Atomic** — order + order items + inventory decrement + cart clear happen in
   one MySQL transaction; any failure rolls back *everything* (verified with a
   fault-injected mid-transaction failure: no partial order, stock untouched,
   cart intact).
-- **Concurrency-safe** â€” `SELECT â€¦ FOR UPDATE` row locks (cart row first, then
+- **Concurrency-safe** — `SELECT … FOR UPDATE` row locks (cart row first, then
   inventory rows in `product_id` order) make two customers racing for the last
-  unit produce exactly one `201` and one `409` â€” stock can never go negative.
-- **Price snapshots** â€” `OrderItem.unitPrice` freezes the purchase price; later
+  unit produce exactly one `201` and one `409` — stock can never go negative.
+- **Price snapshots** — `OrderItem.unitPrice` freezes the purchase price; later
   `Product.price` changes never rewrite history; totals are
-  `Î£(unitPrice Ã— qty)`, computed server-side with `Decimal` (never trusted from
+  `Σ(unitPrice × qty)`, computed server-side with `Decimal` (never trusted from
   the client).
-- **Ownership everywhere** â€” cart and order lookups are keyed by the JWT
+- **Ownership everywhere** — cart and order lookups are keyed by the JWT
   identity; another user's order/cart is indistinguishable from nonexistent
   (404). No `userId` is ever accepted from a request body.
 
@@ -294,19 +348,19 @@ real MySQL; auto-cleanup, no seed data left behind).
 
 Payment guarantees (all verified by integration + live tests):
 
-- **Server-side amount** â€” the request body has no `amount` field; the value
+- **Server-side amount** — the request body has no `amount` field; the value
   charged and stored always equals `Order.totalAmount` (client-supplied
   numbers are ignored).
-- **State machines** â€” `PENDING â†’ PAYMENT_PROCESSING â†’ PAID` for orders;
-  `PROCESSING â†’ SUCCEEDED | FAILED` for payments, centralized in
-  `payment.states.ts`; invalid transitions â†’ 409. A failed payment returns the
+- **State machines** — `PENDING → PAYMENT_PROCESSING → PAID` for orders;
+  `PROCESSING → SUCCEEDED | FAILED` for payments, centralized in
+  `payment.states.ts`; invalid transitions → 409. A failed payment returns the
   order to `PENDING` and can never pair `FAILED` with `PAID`.
-- **Idempotency** â€” `idempotencyKey` (required) replays the original result
+- **Idempotency** — `idempotencyKey` (required) replays the original result
   with HTTP 200 and **no second charge** (including concurrent duplicates,
   backed by `payments.idempotency_key UNIQUE`); `payments.order_id UNIQUE`
   means one payment row per order, so two successes are structurally
   impossible. Retries reuse the same row (`attemptCount++`).
-- **Provider abstraction** â€” a `PaymentProvider` interface with a
+- **Provider abstraction** — a `PaymentProvider` interface with a
   deterministic simulator behind it; swapping in a real PSP changes one file.
 - **Notifications** ... `PAYMENT_SUCCEEDED` / `PAYMENT_FAILED` are **not** written
   by the payment transaction any more. The payment commits an outbox event
@@ -336,9 +390,9 @@ delivery, consumer idempotency, dead-letter queues).
 
 **Done (Day 2)**
 
-- [x] `POST /api/auth/register` â€” validation, email normalization, bcrypt(12),
-      **User + Cart created in one transaction**, P2002â†’409 duplicate handling
-- [x] `POST /api/auth/login` â€” single query, bcrypt compare, signed JWT
+- [x] `POST /api/auth/register` — validation, email normalization, bcrypt(12),
+      **User + Cart created in one transaction**, P2002→409 duplicate handling
+- [x] `POST /api/auth/login` — single query, bcrypt compare, signed JWT
       (HS256, 15m, `iss`)
 - [x] `GET /api/auth/me` protected by reusable `requireAuth` middleware
 - [x] JWT config via env with fail-fast validation; `.env` git-ignored
@@ -347,38 +401,38 @@ delivery, consumer idempotency, dead-letter queues).
 
 **Done (Day 3)**
 
-- [x] `GET /api/products` â€” public, offset pagination (page/limit, `limit` â‰¤ 100),
+- [x] `GET /api/products` — public, offset pagination (page/limit, `limit` ≤ 100),
       `search` (name/description `contains`), `category`, `minPrice`/`maxPrice`,
       composable filters, `{ data, pagination }` envelope
-- [x] `GET /api/products/:id` â€” public detail, clean 400/404
-- [x] `POST /api/products` (ADMIN) â€” validation, SKU uniqueness â†’ 409
-- [x] `PATCH /api/products/:id` (ADMIN) â€” partial updates, immutable id, 404/409
-- [x] `DELETE /api/products/:id` (ADMIN) â€” reference guard â†’ clean 409 when
+- [x] `GET /api/products/:id` — public detail, clean 400/404
+- [x] `POST /api/products` (ADMIN) — validation, SKU uniqueness → 409
+- [x] `PATCH /api/products/:id` (ADMIN) — partial updates, immutable id, 404/409
+- [x] `DELETE /api/products/:id` (ADMIN) — reference guard → clean 409 when
       the product appears in orders or carts (order history is never cascaded)
 - [x] `requireRole('ADMIN')` middleware (401 vs 403, role from identity)
 - [x] Migration: `idx_products_price` (range-filter index, decision documented)
-- [x] `docs/PRODUCTS.md` â€” query design, pagination/search/index trade-offs,
+- [x] `docs/PRODUCTS.md` — query design, pagination/search/index trade-offs,
       authorization, system-design evolution notes
 
 **Done (Day 4)**
 
-- [x] Cart module â€” `GET /api/cart`, add (upsert on `UNIQUE(cart_id, product_id)`),
+- [x] Cart module — `GET /api/cart`, add (upsert on `UNIQUE(cart_id, product_id)`),
       update, remove; ownership from the JWT identity; backend-authoritative
       validation (400/404/409 table in `docs/CART.md`)
-- [x] Checkout â€” `POST /api/orders`: cart â†’ order inside **one transaction**
+- [x] Checkout — `POST /api/orders`: cart → order inside **one transaction**
       (order + items + inventory decrement + cart clear, or full rollback)
-- [x] Concurrency safety â€” `SELECT â€¦ FOR UPDATE` on the cart row, then
+- [x] Concurrency safety — `SELECT … FOR UPDATE` on the cart row, then
       inventory rows in `product_id` order; two checkouts racing for the last
-      unit â†’ exactly one 201, one 409, stock never negative
-- [x] Price snapshots â€” `OrderItem.unitPrice` frozen at checkout; totals =
-      `Î£(unitPrice Ã— qty)` in `Decimal`, computed server-side
+      unit → exactly one 201, one 409, stock never negative
+- [x] Price snapshots — `OrderItem.unitPrice` frozen at checkout; totals =
+      `Σ(unitPrice × qty)` in `Decimal`, computed server-side
 - [x] `GET /api/orders` (paginated summaries) and `GET /api/orders/:id`
       (detail; other users' orders 404, IDOR-safe)
 - [x] Integration test suite (`npm test`, 29 tests: cart, checkout, atomicity
       via fault injection, concurrent-checkout race) with automatic cleanup
-- [x] `docs/CART.md` + `docs/ORDERS.md` â€” ACID, the oversell race, snapshot
+- [x] `docs/CART.md` + `docs/ORDERS.md` — ACID, the oversell race, snapshot
       pricing, idempotency analysis, evolution path
-- [x] **No schema change, no new migration, no new indexes needed** â€” Day 1
+- [x] **No schema change, no new migration, no new indexes needed** — Day 1
       schema and existing indexes already covered every Day-4 query
 
 **Done (Day 5)**
@@ -448,14 +502,51 @@ delivery, consumer idempotency, dead-letter queues).
       publishes (`npm test`: 108 tests, 8 files)
 - [x] `docs/RELIABILITY.md` + the Day-8 variables in `.env.example`
 
-**Not done yet â€” deliberately**
+**Done (Day 9)**
 
-- âŒ Admin order management, order cancellation, refunds
-- âŒ Frontend scaffold
-- âŒ Cursor pagination, MySQL FULLTEXT / search engine (documented evolution path)
-- âŒ Idempotency keys (analysed in `docs/ORDERS.md` Â§9 â€” built with payments)
+- [x] One multi-stage `Dockerfile` with two targets: `runtime` (runs as the
+      non-root `node` user, `tini` as PID 1 so Day 8's `SIGTERM` sequence actually
+      runs) and `migrate` (prisma CLI + migrations, nothing else). The API and the
+      worker are the **same bytes** — the role is a Compose `command:` override
+- [x] `prisma generate` runs inside the image, because the query engine is a
+      native per-platform binary; `.dockerignore` keeps `node_modules` and `.env`
+      out of the build context (one breaks the Linux build, the other leaks a
+      secret into layer cache)
+- [x] Build-time assertions: the generated client and its engine binary exist, and
+      both entrypoints parse — a broken image fails a build, not a deploy
+- [x] A production-only install that was checked rather than assumed: npm installs
+      `@prisma/client`'s optional peer `prisma` even under `--omit=dev`, and
+      `--omit=peer` does not remove it (both verified against this lockfile), so
+      the ~50 MB CLI is deleted in the layer that created it — and CI booting the
+      image is what makes that a checked claim
+- [x] `docker-compose.yml`: MySQL 8.4, Redis 7, single-node KRaft Kafka, a
+      one-shot `migrate` service, `api`, `worker`. Every `depends_on` edge is a
+      healthcheck or an exit code, never "the container was created"; Kafka
+      publishes only its host listener, because advertised addresses must be
+      reachable from the *client's* network
+- [x] `stop_grace_period: 15s` > `SHUTDOWN_TIMEOUT_MS: 10000` as one decision, and
+      host ports 3308/6380/29092 so the stack coexists with this machine's own
+      MySQL/Redis/Kafka instead of fighting them
+- [x] GitHub Actions: `static` (no ESLint config exists in this repo, so
+      `tsc --noEmit` *is* the lint step and is named as such) → `integration-tests`
+      against MySQL/Redis/Kafka service containers, with broker readiness proven
+      first so a missing Kafka cannot masquerade as a passing suite → `docker`
+      (build both targets, `compose up --wait`, probe live/ready/metrics,
+      register + login + catalog smoke test, assert the worker joined its group and
+      that `docker compose stop` exits **0**, not 137)
+- [x] `docs/DEPLOYMENT.md` — decisions with their costs, what was verified where,
+      troubleshooting, and next steps
+
+**Not done yet — deliberately**
+
+- ❌ Admin order management, order cancellation, refunds
+- ❌ Frontend scaffold
+- ❌ Cursor pagination, MySQL FULLTEXT / search engine (documented evolution path)
+- ❌ Idempotency keys for **checkout** (analysed in `docs/ORDERS.md` §9 — payments
+      have them; checkout does not yet)
 - ... Refresh tokens, OAuth, password reset, email verification
-- ... Docker, Kubernetes, microservices (Kafka + the background worker are done)
+- ... Kubernetes manifests, autoscaling, microservices (containerization and CI
+      are done — see `docs/DEPLOYMENT.md`)
 
 ## 11. Planned future stages
 
@@ -465,7 +556,9 @@ delivery, consumer idempotency, dead-letter queues).
 | 5 | ~~Simulated payments, inventory reservations, order status transitions, notifications~~ **done (Day 5)** |
 | 6 | ~~Caching (Redis), background workers, rate limiting~~ **done (Day 6)** |
 | 7 | ~~Events (Kafka)~~ **done (Day 7)** |
-| 8 | ~~Observability: logs, request ids, metrics, probes, graceful shutdown~~ **done (Day 8)**; containerization (Docker), CI |
+| 8 | ~~Observability: logs, request ids, metrics, probes, graceful shutdown~~ **done (Day 8)** |
+| 9 | ~~Containerization (multi-stage image + Compose stack) and CI (type-check, integration tests on real services, image build + stack boot)~~ **done (Day 9)** |
+| 10 | Frontend (React + TypeScript) against this API, plus admin order management |
 
 Exact scope may change as we learn; the rule stays: **only add what solves a
 real problem we have actually hit**.

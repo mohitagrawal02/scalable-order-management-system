@@ -57,4 +57,19 @@ npm run typecheck          # tsc --noEmit
 npm run prisma:generate    # regenerate the Prisma client
 npm run prisma:migrate     # prisma migrate dev (create + apply next migration)
 npm run prisma:studio      # open Prisma Studio in the browser
+npm test                   # integration suite (needs MySQL; Redis/Kafka optional)
 ```
+
+### In a container (Day 9)
+
+```bash
+# from the repository root
+docker build --target runtime -t ecommerce-platform-backend:local backend
+docker compose up -d --build      # mysql + redis + kafka + migrate + api + worker
+```
+
+The same image serves both roles: `dist/server.js` by default, `dist/worker.js`
+when Compose overrides `command:`. See
+[`../docs/DEPLOYMENT.md`](../docs/DEPLOYMENT.md) for the build stages, and note
+that this repository's development machine has no Docker — CI is what builds and
+boots the image.

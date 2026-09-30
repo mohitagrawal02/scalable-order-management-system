@@ -1,0 +1,329 @@
+# ============================================================================
+# Local / CI stack: everything the backend needs, in one command
+# ============================================================================
+#   cp .env.example .env         # only JWT_SECRET is mandatory
+#   docker compose up --build    # or: docker compose up -d --build
+#   curl http://localhost:4000/api/health/ready
+#   docker compose down          # add -v to also delete the MySQL/Kafka volumes
+#
+# Six services. The interesting part of this file is not the images, it is the
+# EDGES: what must be true before a container may start, what "started" means
+# for each of them, and how each is allowed to die. Those three questions are
+# the whole subject, and every answer below sits on the line it governs.
+#
+# Validate an edit with:  docker compose config --quiet
+# ============================================================================
+
+name: ecommerce-platform
+
+# ----------------------------------------------------------------------------
+# Shared build for the two application services.
+# Same anchor, same target, same image tag -> the image is built ONCE and the
+# api and worker containers run identical bytes (Day 7's "one codebase, two
+# process roles" finally expressed as infrastructure).
+# ----------------------------------------------------------------------------
+x-backend-build: &backend-build
+  context: ./backend
+  target: runtime
+
+# ----------------------------------------------------------------------------
+# Shared environment for the two application services. `<<:` merges it, then
+# each service adds the one variable that makes it itself: SERVICE_NAME.
+# ----------------------------------------------------------------------------
+x-app-env: &app-env
+  NODE_ENV: production
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+
+  # Hostnames, not localhost. Inside the Compose network "localhost" is the
+  # container itself, which is why the DATABASE_URL that works on your machine
+  # (@127.0.0.1:3307) cannot work in here. The same rule is why Kafka needs the
+  # advertised-listener story below.
+  DATABASE_URL: mysql://${MYSQL_USER:-ecommerce_app}:${MYSQL_PASSWORD:-ecommerce_dev_only}@mysql:3306/${MYSQL_DATABASE:-ecommerce_platform}
+
+  # Redis and Kafka keep their Day 6 / Day 7 optionality here too: the API would
+  # boot and serve traffic with either of them missing. Depending on them below
+  # is about a pleasant first minute, not about correctness.
+  REDIS_URL: redis://redis:6379
+  KAFKA_BROKERS: kafka:9092
+  KAFKA_ENABLED: "true"
+
+  # No default on purpose - Compose refuses to start without it. That is the
+  # friendliest possible failure: a forgotten secret is a startup message, while
+  # a placeholder secret is invisible until somebody mints a valid token.
+  # (config/index.ts independently refuses placeholder and short secrets when
+  # NODE_ENV=production, so a mistake has to survive both layers.)
+  JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required - copy .env.example to .env}
+  JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-15m}
+
+  # Mandatory in production: config/index.ts refuses to boot with wildcard CORS
+  # once NODE_ENV=production. This is the Day 10 frontend dev-server origin -
+  # extend the list when the deployed frontend has a real one.
+  CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+
+  # Direct connection, no proxy in front of this stack, so the socket's peer
+  # address IS the client's - which is what the login rate limiter needs.
+  # (TRUST_PROXY=true is refused in production: a header anyone can set lets a
+  # client choose its own rate-limit bucket.)
+  TRUST_PROXY: "false"
+
+  # The Day 8 shutdown budget, deliberately smaller than stop_grace_period on
+  # the services below. Our budget is what runs; Docker's timer is what kills.
+  # If the platform's timer wins, the shutdown steps never execute - so these
+  # two numbers must always be read together.
+  SHUTDOWN_TIMEOUT_MS: "10000"
+  SHUTDOWN_DRAIN_TIMEOUT_MS: "5000"
+
+services:
+  # --------------------------------------------------------------------------
+  # mysql - the system of record
+  # --------------------------------------------------------------------------
+  mysql:
+    # 8.4 (LTS), not 8.0: 8.0 reached end of life in April 2026. Prisma 6 talks
+    # to it over TCP with caching_sha2_password; the known 8.4 friction is
+    # socket-based auth, which a network URL does not use.
+    image: mysql:8.4
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      # Timestamps in UTC. Prisma already sends UTC, but the server's own
+      # CURRENT_TIMESTAMP defaults - which back created_at columns - follow this,
+      # and a server on +05:30 makes "orders in the last 24 hours" quietly wrong.
+      - --default-time-zone=+00:00
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_dev_only}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-ecommerce_platform}
+      MYSQL_USER: ${MYSQL_USER:-ecommerce_app}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-ecommerce_dev_only}
+    ports:
+      # 3308 on the host, not 3306: this project's own dev machine keeps a local
+      # mysqld on 3307, and 3306 is the most collideable port in existence.
+      # Published at all only so host-side tools can look at the same data.
+      - "${MYSQL_HOST_PORT:-3308}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      # 127.0.0.1 rather than a socket, and that is the trick: on first boot the
+      # image initialises the database with a temporary server that has
+      # networking DISABLED, so a TCP ping cannot go green until the real server
+      # - the one Prisma will use - is listening. `$$` is Compose's escape for a
+      # literal $, so the password is read inside the container, not by the shell
+      # that rendered this file.
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # redis - catalog cache + login rate limiting (an optimisation layer)
+  # --------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    # No AOF: losing the cache costs some MySQL load for a few seconds, which is
+    # exactly the degradation Day 6 was built to absorb. Durability would be paid
+    # for on every start to protect data we can rebuild.
+    command: ["redis-server", "--appendonly", "no"]
+    ports:
+      - "${REDIS_HOST_PORT:-6380}:6379"
+    healthcheck:
+      # redis-cli ping exits non-zero while the socket is down and while an RDB
+      # is loading, so this is a readiness signal, not a "process exists" one.
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # kafka - single-node KRaft broker (no ZooKeeper)
+  # --------------------------------------------------------------------------
+  # Same official image and the same shape CI runs, so "works locally, hangs in
+  # CI" has one fewer place to hide. Day 7's PowerShell script stays available for
+  # host-only development; this is the reproducible version of the same broker.
+  kafka:
+    image: apache/kafka:4.0.2
+    # The controller votes are addressed by hostname, so the container needs the
+    # name it advertises, even though Compose already gives it that alias.
+    hostname: kafka
+    ports:
+      # Only the host-facing listener is published (29092 -> 29092). 9092 stays
+      # internal on purpose: nothing on the host can use an address that only
+      # resolves inside this network, and publishing it would just invite a
+      # connection that succeeds and then hangs.
+      - "${KAFKA_HOST_PORT:-29092}:29092"
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: CONTROLLER://:9093,PLAINTEXT://:9092,PLAINTEXT_HOST://:29092
+      # THE most common Kafka-in-Docker mistake, and the one that produces no
+      # error message: a broker hands a client the ADVERTISED address, not the
+      # address the client dialed. So every advertised address must be reachable
+      # from the CLIENT's network: kafka:9092 for containers on this network
+      # (that is what KAFKA_BROKERS uses), localhost:29092 for a tool or an
+      # `npm run dev` process running directly on your machine.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Single node: nothing can replicate, so every internal topic must accept
+      # RF=1/min.ISR=1 or the broker refuses to write to them at all.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      # The 3s rebalance delay exists to protect a broker from restart storms in
+      # production. On a laptop it is just 3 seconds of waiting for nothing.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      # Our code creates its topics explicitly; this only affects anything
+      # auto-created, and pinning it keeps partition counts identical everywhere.
+      KAFKA_NUM_PARTITIONS: "1"
+      CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      # Ask the broker what it speaks. Unlike a port check this proves the
+      # request path works end to end: metadata has to come back, which means
+      # the listener bound, the controller elected itself and the advertised
+      # address resolved. Slow (~1-2s), which is why the interval is generous.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 45s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # migrate - a step, not a service
+  # --------------------------------------------------------------------------
+  # WHY THIS EXISTS: if the api and the worker each migrated the database, they
+  # would race, and "who owns the schema?" would be a rumour. So the schema gets
+  # its own container with an exit code, and both app services wait for
+  # `service_completed_successfully`. It runs to completion and stays exited -
+  # `docker compose ps -a` shows it as exited (0), which is the success signal.
+  #
+  # In a real deployment this is a release step in the pipeline rather than a
+  # container in the runtime stack. It is here because "the migrations that ship
+  # with the code are applied by the code" is the property worth having locally.
+  migrate:
+    build:
+      context: ./backend
+      target: migrate
+    environment:
+      DATABASE_URL: mysql://${MYSQL_USER:-ecommerce_app}:${MYSQL_PASSWORD:-ecommerce_dev_only}@mysql:3306/${MYSQL_DATABASE:-ecommerce_platform}
+    depends_on:
+      mysql:
+        condition: service_healthy
+    # One attempt, honestly reported. Restarting a migration on a loop would
+    # hide a half-applied migration behind an endless retry.
+    restart: "no"
+
+  # --------------------------------------------------------------------------
+  # api - HTTP on the critical path
+  # --------------------------------------------------------------------------
+  api:
+    build: *backend-build
+    image: ecommerce-platform-backend:local
+    command: ["node", "dist/server.js"]
+    environment:
+      <<: *app-env
+      # The one variable that distinguishes an API log line from a worker log
+      # line when both share a stream (config.service / config.log.service).
+      SERVICE_NAME: ecommerce-api
+    ports:
+      - "${API_HOST_PORT:-4000}:4000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # SIGTERM is sent, then Docker waits this long before SIGKILL. It must
+    # exceed SHUTDOWN_TIMEOUT_MS (10s) with room to spare, or the platform's
+    # timer wins the race and the Day 8 shutdown steps never finish. That
+    # mismatch is invisible in the logs, because the process that would have
+    # written them has been killed - which is why CI asserts the exit code.
+    stop_grace_period: 15s
+    healthcheck:
+      # Node's own fetch, not curl: the image has no curl, and installing one
+      # just to answer a probe would add an attack surface to every deployed
+      # byte. `/api/health/live` is the right URL because it does no I/O at all -
+      # "is this process wedged?" must not depend on MySQL (docs/RELIABILITY.md).
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:' + (process.env.PORT || 4000) + '/api/health/live').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # worker - outbox dispatcher + notification consumer
+  # --------------------------------------------------------------------------
+  worker:
+    build: *backend-build
+    image: ecommerce-platform-backend:local
+    # Same image, different job. Nothing else about the deployment differs, which
+    # is the point: the worker cannot drift from the API it consumes events from.
+    command: ["node", "dist/worker.js"]
+    environment:
+      <<: *app-env
+      SERVICE_NAME: ecommerce-worker
+    depends_on:
+      mysql:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      # Redis is deliberately NOT in this list. The worker closes a Redis handle
+      # on shutdown for symmetry, but it reads no cache and runs no rate limiter,
+      # so requiring Redis to be up first would invent a dependency Day 6 and 7
+      # decided not to have.
+    # Same budget as the API, for the same reason: the consumer must be allowed
+    # to finish the message it is inside and leave the group cleanly, so that
+    # the offsets it committed stay truthful.
+    stop_grace_period: 15s
+    # NO HEALTHCHECK, on purpose and not by omission: the worker opens no port,
+    # so there is nothing to probe from outside, and "the node process exists"
+    # would be a false comfort. Its real failure mode is already loud - src/
+    # worker.ts exits(1) when the broker is unreachable, and `restart:
+    # unless-stopped` turns that into a visible crash loop instead of a silent
+    # idle consumer. A true consumer-liveness signal (last heartbeat, lag) is
+    # listed as a next step in docs/DEPLOYMENT.md.
+    restart: unless-stopped
+
+# ----------------------------------------------------------------------------
+# Named volumes, so `docker compose down` keeps data and `down -v` discards it
+# deliberately. Delete a kafka-data volume rather than editing its metadata by
+# hand whenever the KRaft settings underneath it change.
+# ----------------------------------------------------------------------------
+volumes:
+  mysql-data:
+  kafka-data:
+
+# To browse topics, consumer lag and dead-letter traffic while developing, add:
+#   kafka-ui:
+#     image: kafbat/kafka-ui:latest
+#     ports: ["8080:8080"]
+#     environment:
+#       DYNAMIC_CONFIG_ENABLED: "true"
+#       KAFKA_CLUSTERS_0_NAME: local
+#       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+#     depends_on:
+#       kafka:
+#         condition: service_healthy
+# then open http://localhost:8080. It is left out because it is a debugging aid,
+# not part of the system, and a stack that grows one "temporary" service per
+# feature stops being reproducible.
+
+
+

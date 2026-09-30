@@ -92,7 +92,7 @@ Source of truth: `backend/prisma/schema.prisma`. Applied as SQL migrations in
 | Redis           | No caching or rate-limiting need exists; state is in MySQL | Read-heavy product pages; hot sessions |
 | Kafka           | No cross-service events; a single process can handle everything transactionally | Notifications/analytics fan-out; second service |
 | Background workers | Nothing is slow or out-of-band yet                    | Payment confirmations, invoice emails  |
-| Docker / K8s    | Local dev is simpler without it; adds mental load now     | Reproducible env for others / CI + deployment |
+| Docker / K8s    | ~~Docker~~ **Docker arrived on Day 9** (multi-stage image + Compose + CI). Kubernetes still has nothing to schedule: one host runs both process roles comfortably | A real cluster, or more than one machine's worth of traffic |
 | Microservices   | No independent scaling or ownership boundary yet          | A module with an independent profile   |
 | Frontend        | No API surface worth consuming yet                        | After auth/products APIs exist          |
 
@@ -211,6 +211,39 @@ system *does* under failure:
 Full details, including the defects found while inspecting Day 7 (notably the
 outbox retry budget being consumed by the poll interval):
 [`RELIABILITY.md`](./RELIABILITY.md).
+
+## 5.10 Packaging & delivery notes (Day 9)
+
+Nothing about the *running system* changed on Day 9; what changed is how it is
+produced. That is deliberate — packaging that forces a code change is packaging
+that was wrong.
+
+- **One image, two roles.** Day 7's split was process-level, not
+  codebase-level, so the artifact is one image and the role is a startup
+  `command:`. "Works in the API image, breaks in the worker image" stops being a
+  representable failure.
+- **Migrations are a step with an exit code**, not something a booting process
+  does opportunistically: two services racing to apply the same SQL is a failed
+  deploy with extra steps. In a real pipeline this step moves out of the runtime
+  stack entirely.
+- **Signals are part of the architecture.** Day 8's ordered shutdown only happens
+  if something at PID 1 forwards `SIGTERM` (`tini`), and its budget only means
+  something if the platform's grace period is larger than it. Those two numbers
+  now live next to each other in this repo, and CI asserts the resulting exit
+  code rather than trusting that they agree.
+- **The native-binary boundary is a build-time boundary.** Prisma's query engine
+  is chosen per platform, so codegen happens inside the image. This is the same
+  lesson as every other day: the failure you prevent is cheaper than the one you
+  debug in production.
+- **Optional infrastructure stays optional in the stack.** The API still boots and
+  serves with Redis or Kafka missing; Compose starts them anyway because a
+  developer should not have to reason about degradation on the first run.
+- **CI is the packaging's test suite.** The development machine has no Docker, so
+  the pipeline is the only thing that ever builds or boots this image. That is
+  stated rather than hidden: [`DEPLOYMENT.md`](./DEPLOYMENT.md) §9 lists exactly
+  what was verified locally and what CI verifies first.
+
+Details, the trade-off table and troubleshooting: [`DEPLOYMENT.md`](./DEPLOYMENT.md).
 
 ## 6. How the architecture is expected to evolve
 
