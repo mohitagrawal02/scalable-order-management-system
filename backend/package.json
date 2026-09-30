@@ -10,7 +10,7 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
-    "test": "node --require ./tests/register.cjs --test --test-concurrency=1 tests/integration/cart.test.ts tests/integration/orders.test.ts tests/integration/payments.test.ts tests/integration/outbox.test.ts tests/integration/cache.test.ts tests/integration/rateLimit.test.ts tests/integration/kafka.test.ts",
+    "test": "node --require ./tests/register.cjs --test --test-concurrency=1 tests/integration/cart.test.ts tests/integration/orders.test.ts tests/integration/payments.test.ts tests/integration/outbox.test.ts tests/integration/cache.test.ts tests/integration/rateLimit.test.ts tests/integration/kafka.test.ts tests/integration/observability.test.ts",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:studio": "prisma studio",

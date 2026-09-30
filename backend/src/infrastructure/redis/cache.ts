@@ -1,4 +1,8 @@
+import { getLogger, type LogFields } from '../logging';
 import { redis } from './client';
+
+/** Structured logger for this module (Day 8). */
+const cacheLogger = getLogger({ module: 'cache' });
 
 /**
  * Generic JSON cache on top of Redis (Day 6).
@@ -85,14 +89,22 @@ export function resetCacheStats(): void {
   stats.keysDeleted = 0;
 }
 
-/** One log line per operation - the whole "metrics" story for Day 6. */
-function logCache(event: string, key: string, extra = ''): void {
-  console.log(`[cache] ${event} key="${key}"${extra}`);
+/**
+ * One log line per operation - the whole "metrics" story for Day 6, structured
+ * as of Day 8: `key`, `durationMs`, `ttlSeconds` etc. are FIELDS instead of text
+ * embedded in one string, so hit rate and latency can be queried per operation
+ * without parsing, and every line automatically carries the requestId of the
+ * request that triggered it.
+ */
+function logCache(event: string, key: string, fields: LogFields = {}): void {
+  cacheLogger.info(`cache ${event}`, { key, ...fields });
 }
 
 function logCacheError(event: string, key: string, err: unknown): void {
-  const message = err instanceof Error ? err.message : String(err);
-  console.error(`[cache] ${event} key="${key}" error="${message}"`);
+  cacheLogger.error(`cache ${event}`, {
+    key,
+    error: err instanceof Error ? err.message : String(err),
+  });
 }
 
 /** Real Redis-backed command set (single shared client, see client.ts). */
@@ -111,7 +123,7 @@ export function createCache(commands: CacheCommandSet): Cache {
       const deleted = await commands.del(keys);
       stats.invalidations += 1;
       stats.keysDeleted += deleted;
-      logCache('invalidate', keys.join(','), ` deleted=${deleted}`);
+      logCache('invalidate', keys.join(','), { deleted });
       return deleted;
     } catch (err) {
       stats.errors += 1;
@@ -137,14 +149,14 @@ export function createCache(commands: CacheCommandSet): Cache {
 
     if (raw === null) {
       stats.misses += 1;
-      logCache('miss', key, ` durationMs=${Date.now() - startedAt}`);
+      logCache('miss', key, { durationMs: Date.now() - startedAt });
       return { outcome: 'miss' };
     }
 
     try {
       const value = JSON.parse(raw) as T;
       stats.hits += 1;
-      logCache('hit', key, ` durationMs=${Date.now() - startedAt}`);
+      logCache('hit', key, { durationMs: Date.now() - startedAt });
       return { outcome: 'hit', value };
     } catch (err) {
       // An unparseable value (old format, truncated write, manual edit) is
@@ -170,7 +182,7 @@ export function createCache(commands: CacheCommandSet): Cache {
     try {
       await commands.set(key, serialized, ttlSeconds);
       stats.sets += 1;
-      logCache('set', key, ` ttlSeconds=${ttlSeconds}`);
+      logCache('set', key, { ttlSeconds });
       return true;
     } catch (err) {
       stats.setFailures += 1;
@@ -186,7 +198,7 @@ export function createCache(commands: CacheCommandSet): Cache {
   async function increment(key: string): Promise<number | null> {
     try {
       const value = await commands.incr(key);
-      logCache('increment', key, ` value=${value}`);
+      logCache('increment', key, { value });
       return value;
     } catch (err) {
       stats.errors += 1;

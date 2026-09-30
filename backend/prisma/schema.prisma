@@ -302,6 +302,15 @@ model OutboxEvent {
   status        OutboxEventStatus @default(PENDING)
   attempts      Int              @default(0)
   lastError     String?          @map("last_error") @db.VarChar(500)
+  /// Earliest time the dispatcher may try this row again (Day 8).
+  ///
+  /// NULL means "eligible now": a freshly enqueued row, or one that published
+  /// successfully. A failed row gets an explicit timestamp so retries back off
+  /// exponentially instead of being re-attempted on every 2s poll - without
+  /// this column the retry budget is consumed by the POLL INTERVAL, not by
+  /// real attempts spread over time, so a 30s broker outage dead-letters
+  /// everything.
+  nextAttemptAt DateTime?        @map("next_attempt_at")
   occurredAt    DateTime         @map("occurred_at")
   publishedAt   DateTime?        @map("published_at")
   createdAt     DateTime         @default(now()) @map("created_at")

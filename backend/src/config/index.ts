@@ -94,6 +94,80 @@ function optionalBoolean(value: string | undefined, name: string, fallback: bool
   throw new Error(`Environment variable ${name} must be true/false. Got: "${value}"`);
 }
 
+/** The environments this project actually supports. */
+const NODE_ENVS = ['development', 'test', 'production'] as const;
+type NodeEnv = (typeof NODE_ENVS)[number];
+
+function readNodeEnv(): NodeEnv {
+  const raw = (process.env.NODE_ENV ?? 'development').trim().toLowerCase();
+  if (!(NODE_ENVS as readonly string[]).includes(raw)) {
+    throw new Error(`NODE_ENV must be one of ${NODE_ENVS.join(' | ')}. Got: "${raw}"`);
+  }
+  return raw as NodeEnv;
+}
+
+const LOG_LEVELS = ['debug', 'info', 'warn', 'error', 'silent'] as const;
+
+/**
+ * Log verbosity. Validated here so a typo (`LOGG_LEVEL=verbose`) fails at boot
+ * instead of silently falling back to a default nobody chose.
+ */
+function readLogLevel(): string {
+  const raw = (process.env.LOG_LEVEL ?? 'info').trim().toLowerCase();
+  if (!(LOG_LEVELS as readonly string[]).includes(raw)) {
+    throw new Error(`LOG_LEVEL must be one of ${LOG_LEVELS.join(' | ')}. Got: "${raw}"`);
+  }
+  return raw;
+}
+
+/**
+ * `trust proxy` (Day 8). Express uses this to decide whether `X-Forwarded-For`
+ * may be believed when computing `req.ip`.
+ *
+ * The default is `false`, which is the SAFE default: with no trusted proxy, a
+ * client could otherwise send `X-Forwarded-For: <random>` on every login attempt
+ * and bypass the (ip + account) rate limiter entirely. Only enable it when a
+ * reverse proxy/load balancer you control really is in front, and then set it to
+ * the specific hop count or subnet - never blanket `true` in production.
+ */
+function readTrustProxy(): boolean | number | string {
+  const raw = process.env.TRUST_PROXY?.trim();
+  if (raw === undefined || raw === '') return false;
+  if (raw === 'true') return true;
+  if (raw === 'false') return false;
+  if (/^\d+$/.test(raw)) return Number.parseInt(raw, 10);
+  return raw; // e.g. 'loopback' or a CIDR list - passed through to Express
+}
+
+/**
+ * CORS allowlist (Day 8). The Express `cors()` default (`*`) is fine for a
+ * public, credential-free API in development, but it is not a decision a
+ * production deployment should inherit by accident - so production refuses to
+ * boot without an explicit list.
+ */
+function readCorsOrigins(env: NodeEnv): 'all' | string[] {
+  const raw = process.env.CORS_ORIGINS?.trim();
+  if (raw === undefined || raw === '' || raw === '*') {
+    if (env === 'production') {
+      throw new Error(
+        'CORS_ORIGINS must be set explicitly in production (comma-separated origins). ' +
+          'Refusing to boot with wildcard CORS, where any website could call this API from a browser.'
+      );
+    }
+    return 'all';
+  }
+
+  const origins = raw
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter((origin) => origin.length > 0);
+  if (origins.length === 0) {
+    throw new Error(`CORS_ORIGINS must list at least one origin. Got: "${raw}"`);
+  }
+  return origins;
+}
+
+
 /**
  * JWT secrets below 32 chars are weak. Failing here (instead of at the first
  * login request) forces a proper secret into .env.
@@ -106,9 +180,83 @@ if (jwtSecret.length < 32) {
   );
 }
 
+const env = readNodeEnv();
+
+/**
+ * Production guard rails (Day 8).
+ *
+ * Everything below has a working development default, and each of those
+ * defaults is exactly what you do NOT want in production: an example JWT
+ * secret, wide-open CORS, a placeholder database URL. Rather than documenting
+ * "remember to change these", the process refuses to start - a boot failure is
+ * loud, immediate and unmissable, whereas a leaked default secret is silent
+ * until it is exploited.
+ */
+const KNOWN_PLACEHOLDER_SECRETS = [
+  'replace-with-a-random-secret-at-least-32-chars-long',
+  'changeme',
+  'secret',
+];
+
+if (env === 'production') {
+  if (KNOWN_PLACEHOLDER_SECRETS.some((placeholder) => jwtSecret.includes(placeholder))) {
+    throw new Error('JWT_SECRET is still a placeholder value. Refusing to start in production.');
+  }
+  if (!process.env.DATABASE_URL || process.env.DATABASE_URL.includes('USER:PASSWORD')) {
+    throw new Error('DATABASE_URL is still the .env.example placeholder. Refusing to start in production.');
+  }
+  // CORS_ORIGINS is validated by readCorsOrigins() below.
+  if (process.env.TRUST_PROXY === 'true') {
+    throw new Error(
+      'TRUST_PROXY=true in production trusts X-Forwarded-For from ANY peer, which makes the ' +
+        'login rate limiter bypassable. Set it to a hop count or a trusted subnet instead.'
+    );
+  }
+}
+
 export const config = {
-  env: process.env.NODE_ENV ?? 'development',
+  env,
   port: toPositiveInt(process.env.PORT as string, 'PORT'),
+  /**
+   * Identifies which deployable a log line came from. The API and the worker
+   * share one codebase and one log stream shape, so this is how their lines are
+   * told apart (along with `role` in the startup logs).
+   */
+  service: process.env.SERVICE_NAME?.trim() || 'ecommerce-platform-backend',
+  log: {
+    /** `debug` locally, `info` in a deployed environment. Validated above. */
+    level: readLogLevel(),
+    service: process.env.SERVICE_NAME?.trim() || 'ecommerce-platform-backend',
+  },
+  http: {
+    /** Passed straight to `app.set('trust proxy', ...)`. Default: false. */
+    trustProxy: readTrustProxy(),
+    /** `'all'` (dev) or an explicit allowlist (required in production). */
+    corsOrigins: readCorsOrigins(env),
+    /**
+     * Total budget for graceful shutdown. In-flight requests get whatever is
+     * left after the other steps; the process never lingers past this.
+     */
+    shutdownTimeoutMs: optionalPositiveInt(
+      process.env.SHUTDOWN_TIMEOUT_MS,
+      'SHUTDOWN_TIMEOUT_MS',
+      10_000
+    ),
+    /** How long to wait for in-flight requests before forcing connections shut. */
+    drainTimeoutMs: optionalPositiveInt(
+      process.env.SHUTDOWN_DRAIN_TIMEOUT_MS,
+      'SHUTDOWN_DRAIN_TIMEOUT_MS',
+      5_000
+    ),
+  },
+  metrics: {
+    /**
+     * When set, `GET /api/metrics` requires `Authorization: Bearer <token>`.
+     * Unset (the local default) leaves it open; a deployment should set it,
+     * because the payload describes internal counters and backlogs.
+     */
+    token: process.env.METRICS_TOKEN?.trim() || '',
+  },
   databaseUrl: process.env.DATABASE_URL as string,
   jwt: {
     secret: jwtSecret,
@@ -187,6 +335,17 @@ export const config = {
       'KAFKA_CONSUMER_RETRY_DELAY_MS',
       250
     ),
+    /**
+     * Ceiling for the consumer's exponential retry backoff (Day 8). Delays grow
+     * 250 -> 500 -> 1000 ... and stop growing here. The number of attempts is
+     * bounded separately by `consumerMaxAttempts`, so this only ever spaces
+     * attempts out - it cannot turn into an unbounded retry loop.
+     */
+    consumerRetryMaxDelayMs: optionalPositiveInt(
+      process.env.KAFKA_CONSUMER_RETRY_MAX_DELAY_MS,
+      'KAFKA_CONSUMER_RETRY_MAX_DELAY_MS',
+      5_000
+    ),
     outbox: {
       /**
        * Attempts before a stuck outbox row is parked as DEAD. This is a much
@@ -203,6 +362,23 @@ export const config = {
         process.env.KAFKA_OUTBOX_DISPATCH_INTERVAL_MS,
         'KAFKA_OUTBOX_DISPATCH_INTERVAL_MS',
         2_000
+      ),
+      /**
+       * First retry delay for a row that failed to publish (Day 8). Grows
+       * exponentially from here up to `retryMaxDelayMs`, and is what makes
+       * `maxAttempts` a budget spread over MINUTES rather than over the
+       * dispatch interval.
+       */
+      retryBaseDelayMs: optionalPositiveInt(
+        process.env.KAFKA_OUTBOX_RETRY_BASE_DELAY_MS,
+        'KAFKA_OUTBOX_RETRY_BASE_DELAY_MS',
+        1_000
+      ),
+      /** Ceiling for the exponential outbox retry backoff. */
+      retryMaxDelayMs: optionalPositiveInt(
+        process.env.KAFKA_OUTBOX_RETRY_MAX_DELAY_MS,
+        'KAFKA_OUTBOX_RETRY_MAX_DELAY_MS',
+        60_000
       ),
       /** Events published per dispatch round (keeps each tick bounded). */
       batchSize: optionalPositiveInt(

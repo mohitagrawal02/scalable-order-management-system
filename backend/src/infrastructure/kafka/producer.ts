@@ -1,8 +1,12 @@
 import { Producer } from 'kafkajs';
 import { config } from '../../config';
+import { getLogger } from '../logging';
 import { kafka, brokerSummary } from './client';
 import { envelopeHeaders, type EventEnvelope } from './envelope';
 import type { PublishableEvent } from './events';
+
+/** Structured logger for this module (Day 8). */
+const producerLogger = getLogger({ module: 'kafka-producer' });
 
 /**
  * Kafka producer (Day 7).
@@ -97,7 +101,7 @@ async function getProducer(): Promise<Producer> {
       .then(() => {
         producer = candidate;
         stats.connects += 1;
-        console.log(`[kafka] producer connected brokers=${brokerSummary()}`);
+        producerLogger.info('producer connected', { brokers: brokerSummary() });
         return candidate;
       })
       .catch((err: unknown) => {
@@ -159,10 +163,12 @@ export async function publishWith(
     const message = err instanceof Error ? err.message : String(err);
     stats.publishFailures += 1;
     stats.lastError = message;
-    console.error(
-      `[kafka] publish failed topic=${topic} eventType=${envelope.eventType} ` +
-        `eventId=${envelope.eventId} error="${message}"`
-    );
+    producerLogger.error('publish failed', {
+      topic,
+      eventType: envelope.eventType,
+      eventId: envelope.eventId,
+      error: message,
+    });
     return { published: false, error: message };
   }
 }
@@ -179,7 +185,7 @@ export async function connectProducer(): Promise<boolean> {
     return true;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error(`[kafka] producer connect failed brokers=${brokerSummary()} error="${message}"`);
+    producerLogger.error('producer connect failed', { brokers: brokerSummary(), error: message });
     return false;
   }
 }

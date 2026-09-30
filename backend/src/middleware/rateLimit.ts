@@ -1,6 +1,10 @@
 import { NextFunction, Request, Response } from 'express';
 import { AppError } from '../errors/AppError';
+import { getLogger } from '../infrastructure/logging';
 import { consumeRateLimit } from '../infrastructure/redis/rateLimiter';
+
+/** Structured logger for this module (Day 8). */
+const rateLimitLogger = getLogger({ module: 'rate-limit' });
 
 /**
  * Reusable Redis-backed rate limiting middleware (Day 6).
@@ -62,7 +66,9 @@ export function rateLimit(options: RateLimitOptions) {
       // middleware itself. A limiter must never be the reason a login cannot
       // be attempted - it is a protection layer, not a gatekeeper of last
       // resort (docs/REDIS.md § "Redis outage and rate limiting").
-      console.error('[rate-limit] middleware error, allowing request:', err);
+      rateLimitLogger.error('rate limit middleware error, allowing request', {
+        error: err instanceof Error ? err.message : String(err),
+      });
       next();
     }
   };

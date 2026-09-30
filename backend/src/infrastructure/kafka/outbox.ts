@@ -1,10 +1,14 @@
 import { Prisma } from '@prisma/client';
 import { config } from '../../config';
 import { prisma } from '../../config/prisma';
+import { getLogger } from '../logging';
 import type { EventEnvelope } from './envelope';
 import type { PublishableEvent } from './events';
 import { envelopeHeaders } from './envelope';
 import { kafkaEnabled, kafkaPublisher, type Publisher } from './producer';
+
+/** Structured logger for this module (Day 8). */
+const outboxLogger = getLogger({ module: 'outbox' });
 
 /**
  * Transactional outbox (Day 7).
@@ -152,6 +156,33 @@ function rowToEvent(row: {
 }
 
 /**
+ * Delay before a failed outbox row becomes eligible for its next attempt.
+ *
+ * THE BUG THIS FIXES (found while inspecting Day 7 for Day 8):
+ * every dispatcher tick selected ALL pending rows and counted one attempt per
+ * row per tick. With the default 2s interval and a 10-attempt budget, a row was
+ * parked as DEAD after ~20 SECONDS of broker unavailability - and a broker
+ * restart takes longer than that. So the retry budget that is supposed to ride
+ * out an outage was being burned by the POLL INTERVAL, not by real attempts
+ * spread over time, and every queued event was dead-lettered by a routine
+ * 30-second blip.
+ *
+ * Now a failed row carries `nextAttemptAt`, so `maxAttempts` is a budget spread
+ * over ~1s + 2s + 4s + ... capped at 60s: roughly 6 minutes of real backoff
+ * before a human has to intervene. Jitter (±25%) keeps a recovered broker from
+ * being hit by the whole backlog in the same tick.
+ */
+export function outboxBackoffMs(
+  attempt: number,
+  baseMs = config.kafka.outbox.retryBaseDelayMs,
+  maxMs = config.kafka.outbox.retryMaxDelayMs
+): number {
+  const exponential = Math.min(baseMs * 2 ** Math.max(0, attempt - 1), maxMs);
+  const jitter = 0.75 + Math.random() * 0.5;
+  return Math.round(exponential * jitter);
+}
+
+/**
  * One dispatch round: publish the oldest pending events.
  *
  * Never throws, and never runs concurrently with itself inside one process
@@ -189,8 +220,14 @@ export async function dispatchOutbox(
   };
 
   try {
+    // Only rows whose backoff has expired. A row waiting for `nextAttemptAt`
+    // stays PENDING and untouched - it is not lost, it is scheduled.
+    const now = new Date();
     const rows = await prisma.outboxEvent.findMany({
-      where: { status: 'PENDING' },
+      where: {
+        status: 'PENDING',
+        OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }],
+      },
       orderBy: { id: 'asc' },
       take: limit,
     });
@@ -216,7 +253,7 @@ export async function dispatchOutbox(
     // A database problem is not an event problem: log and let the next tick
     // try again. The rows are still safely PENDING.
     const message = err instanceof Error ? err.message : String(err);
-    console.error(`[outbox] dispatch failed error="${message}"`);
+    outboxLogger.error('dispatch round failed', { error: message });
     return { ...result, skipped: false };
   } finally {
     inFlight = false;
@@ -268,17 +305,23 @@ async function publishWithRetryAccounting(
         publishedAt: new Date(),
         attempts: attempt,
         lastError: null,
+        // Cleared so a future re-queue of the same aggregate/event never
+        // inherits a stale schedule.
+        nextAttemptAt: null,
       },
     });
 
-    console.log(
-      `[outbox] published topic=${row.topic} eventType=${row.eventType} ` +
-        `eventId=${row.eventId} attempt=${attempt}`
-    );
+    outboxLogger.info('event published', {
+      topic: row.topic,
+      eventType: row.eventType,
+      eventId: row.eventId,
+      attempt,
+    });
     return 'published';
   } catch (err) {
     const message = (err instanceof Error ? err.message : String(err)).slice(0, 500);
     const exhausted = attempt >= maxAttempts;
+    const backoffMs = exhausted ? 0 : outboxBackoffMs(attempt);
 
     await prisma.outboxEvent
       .updateMany({
@@ -289,15 +332,22 @@ async function publishWithRetryAccounting(
           // Parked, not deleted: a DEAD row is evidence, and the alert that
           // fires on it should point at something with a full history.
           status: exhausted ? 'DEAD' : 'PENDING',
+          // The schedule lives in the database, not in memory: it survives a
+          // restart, and every process sharing the table sees the same one.
+          nextAttemptAt: exhausted ? null : new Date(Date.now() + backoffMs),
         },
       })
       .catch(() => undefined); // never let bookkeeping mask the publish error
 
-    console.error(
-      `[outbox] ${exhausted ? 'dead-lettered' : 'publish failed'} topic=${row.topic} ` +
-        `eventType=${row.eventType} eventId=${row.eventId} attempt=${attempt}/${maxAttempts} ` +
-        `error="${message}"`
-    );
+    outboxLogger.error(exhausted ? 'publish budget exhausted, row parked' : 'publish failed', {
+      topic: row.topic,
+      eventType: row.eventType,
+      eventId: row.eventId,
+      attempt,
+      maxAttempts,
+      backoffMs,
+      error: message,
+    });
     return exhausted ? 'dead' : 'retry';
   }
 }
@@ -331,17 +381,20 @@ export function startOutboxDispatcher(): void {
   // Do not hold the process open just to poll for events; an explicit shutdown
   // (or the HTTP server closing) decides when we stop.
   dispatcherTimer.unref?.();
-  console.log(
-    `[outbox] dispatcher started intervalMs=${intervalMs} batchSize=${config.kafka.outbox.batchSize} ` +
-      `maxAttempts=${config.kafka.outbox.maxAttempts}`
-  );
+  outboxLogger.info('dispatcher started', {
+    intervalMs,
+    batchSize: config.kafka.outbox.batchSize,
+    maxAttempts: config.kafka.outbox.maxAttempts,
+    retryBaseDelayMs: config.kafka.outbox.retryBaseDelayMs,
+    retryMaxDelayMs: config.kafka.outbox.retryMaxDelayMs,
+  });
 }
 
 export function stopOutboxDispatcher(): void {
   if (!dispatcherTimer) return;
   clearInterval(dispatcherTimer);
   dispatcherTimer = undefined;
-  console.log('[outbox] dispatcher stopped');
+  outboxLogger.info('dispatcher stopped');
 }
 
 /** Backlog size, surfaced on /api/health. Never throws. */

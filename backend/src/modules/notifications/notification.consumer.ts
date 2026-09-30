@@ -1,6 +1,7 @@
 import { Prisma } from '@prisma/client';
 import { prisma } from '../../config/prisma';
 import { config } from '../../config';
+import { getLogger } from '../../infrastructure/logging';
 import {
   PermanentEventError,
   TOPICS,
@@ -8,6 +9,15 @@ import {
   type ConsumedEvent,
   type RunningConsumer,
 } from '../../infrastructure/kafka';
+
+/**
+ * Structured logger for this module (Day 8).
+ *
+ * The consumer infrastructure runs every handler inside a log context carrying
+ * eventId / correlationId / consumerGroup, so a line written from here (or from
+ * the notification service it calls) is already attributable to one event.
+ */
+const notificationLogger = getLogger({ module: 'notification-consumer' });
 import {
   createPaymentFailedNotification,
   createPaymentSucceededNotification,
@@ -90,8 +100,8 @@ function requireField<T>(payload: Record<string, unknown>, field: string, expect
   return value as T;
 }
 
-function log(message: string): void {
-  console.log(`[notification-consumer] ${message}`);
+function log(message: string, fields: Record<string, unknown> = {}): void {
+  notificationLogger.info(message, fields);
 }
 
 /** True when the error is the dedup ledger's unique constraint firing. */

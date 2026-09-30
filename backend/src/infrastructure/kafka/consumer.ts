@@ -1,9 +1,77 @@
 import { Consumer, KafkaMessage } from 'kafkajs';
 import { config } from '../../config';
+import { getLogger, runWithLogContext } from '../logging';
 import { kafka, brokerSummary } from './client';
 import { parseEnvelope, type EventEnvelope } from './envelope';
 import { kafkaPublisher, type Publisher } from './producer';
 import { TOPICS } from './topics';
+
+/** Structured logger for this module (Day 8). */
+const consumerLogger = getLogger({ module: 'kafka-consumer' });
+
+/**
+ * Consumer counters, composed into `/api/metrics` (Day 8).
+ *
+ * `retried` and `deadLettered` are the two that earn their place: a rising
+ * retry rate is a dependency getting flaky long before anything fails loudly,
+ * and `deadLettered > 0` always means a human has to look at a message.
+ */
+export interface ConsumerStats {
+  consumed: number;
+  succeeded: number;
+  retried: number;
+  deadLettered: number;
+  malformed: number;
+  lastEventAt: string | null;
+  lastError: string | null;
+}
+
+const consumerStats: ConsumerStats = {
+  consumed: 0,
+  succeeded: 0,
+  retried: 0,
+  deadLettered: 0,
+  malformed: 0,
+  lastEventAt: null,
+  lastError: null,
+};
+
+export function getConsumerStats(): ConsumerStats {
+  return { ...consumerStats };
+}
+
+export function resetConsumerStats(): void {
+  consumerStats.consumed = 0;
+  consumerStats.succeeded = 0;
+  consumerStats.retried = 0;
+  consumerStats.deadLettered = 0;
+  consumerStats.malformed = 0;
+  consumerStats.lastEventAt = null;
+  consumerStats.lastError = null;
+}
+
+/**
+ * Backoff between consumer retries: exponential, capped, with jitter.
+ *
+ * Day 7 retried on a FIXED 250ms delay. That is fine for one message and wrong
+ * for a thousand: when a dependency (MySQL, the broker) goes down, every
+ * partition on every instance retries in lockstep, hitting the thing that is
+ * already struggling. Exponential growth spaces the attempts out; the jitter
+ * (±25%) stops independent workers from re-synchronising.
+ *
+ * The budget stays bounded (`maxAttempts`, default 3), so this only ever
+ * delays a retry - it cannot turn into an unbounded retry loop.
+ */
+export function consumerBackoffMs(
+  attempt: number,
+  baseMs = config.kafka.consumerRetryDelayMs,
+  maxMs = config.kafka.consumerRetryMaxDelayMs
+): number {
+  const exponential = Math.min(baseMs * 2 ** Math.max(0, attempt - 1), maxMs);
+  const jitter = 0.75 + Math.random() * 0.5;
+  return Math.round(exponential * jitter);
+}
+
 
 /**
  * Generic idempotency-aware Kafka consumer (Day 7).
@@ -70,7 +138,10 @@ export interface StartConsumerOptions {
   /** Replay the whole log on first join (default false: only new events). */
   fromBeginning?: boolean;
   maxAttempts?: number;
+  /** Base delay for the first retry (grows exponentially from here). */
   retryDelayMs?: number;
+  /** Ceiling for the exponential retry backoff. */
+  retryMaxDelayMs?: number;
   /** Overridable so tests can assert DLQ publishing without a real broker. */
   publisher?: Publisher;
 }
@@ -82,13 +153,21 @@ export interface RunningConsumer {
   stop(): Promise<void>;
 }
 
-/** Structured single-line log, one per message outcome. */
-function log(message: string): void {
-  console.log(`[kafka-consumer] ${message}`);
+/**
+ * One structured log line per message outcome (Day 8).
+ *
+ * These were `console.log` with the fields interpolated into the string. They
+ * now go through the shared logger, so each outcome is a JSON object that a log
+ * store can filter on (`eventId`, `group`, `attempt`, `error`) instead of a line
+ * that has to be regex-parsed. The caller's AsyncLocalStorage context adds the
+ * eventId automatically where one applies.
+ */
+function log(message: string, fields: Record<string, unknown> = {}): void {
+  consumerLogger.info(message, fields);
 }
 
-function logError(message: string): void {
-  console.error(`[kafka-consumer] ${message}`);
+function logError(message: string, fields: Record<string, unknown> = {}): void {
+  consumerLogger.error(message, fields);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -180,6 +259,7 @@ export async function startEventConsumer(
     fromBeginning = false,
     maxAttempts = config.kafka.consumerMaxAttempts,
     retryDelayMs = config.kafka.consumerRetryDelayMs,
+    retryMaxDelayMs = config.kafka.consumerRetryMaxDelayMs,
     publisher = kafkaPublisher,
   } = options;
 
@@ -213,9 +293,17 @@ export async function startEventConsumer(
 
       // --- Case 3: not a valid envelope at all -> DLQ immediately ----------
       if (envelope === null) {
-        logError(
-          `malformed message group=${groupId} topic=${topic} partition=${partition} offset=${offset}`
-        );
+        // Counted separately from handler failures: an unparseable message is a
+        // producer/serialization bug, not a flaky dependency, and the two need
+        // different responses.
+        consumerStats.malformed += 1;
+        logError('malformed message dead-lettered', {
+          group: groupId,
+          topic,
+          partition,
+          offset,
+          bytes: rawValue?.length ?? 0,
+        });
         await deadLetter(
           publisher,
           { consumerGroup: groupId, deadLetterTopic },
@@ -241,19 +329,32 @@ export async function startEventConsumer(
       let lastError = 'Unknown error';
       let permanent = false;
 
+      // Every log written by the handler - and by anything it calls - carries
+      // this event's id without a single extra parameter. That is what makes a
+      // background worker debuggable: see infrastructure/logging/context.ts.
+      const eventContext = {
+        eventId: envelope.eventId,
+        correlationId: envelope.correlationId,
+        consumerGroup: groupId,
+      };
+
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         try {
-          await handler({
-            topic,
-            partition,
-            offset,
-            key,
-            headers,
-            envelope,
-            attempt,
-          });
+          await runWithLogContext(eventContext, () =>
+            handler({ topic, partition, offset, key, headers, envelope, attempt })
+          );
+
+          consumerStats.succeeded += 1;
+          consumerStats.lastEventAt = new Date().toISOString();
+
           if (attempt > 1) {
-            log(`recovered eventType=${envelope.eventType} eventId=${envelope.eventId} attempt=${attempt}`);
+            log('recovered after retry', {
+              eventType: envelope.eventType,
+              topic,
+              partition,
+              offset,
+              attempt,
+            });
           }
           // Heartbeat before committing: if the group rebalanced mid-handler
           // the commit would throw, and we would rather know.
@@ -262,23 +363,47 @@ export async function startEventConsumer(
           return;
         } catch (err) {
           lastError = err instanceof Error ? err.message : String(err);
+          consumerStats.lastError = lastError;
+
           if (err instanceof PermanentEventError) {
+            // A permanent failure must not spend the retry budget: retrying
+            // cannot help, and the delays would hold up the partition behind a
+            // message that will never succeed.
             permanent = true;
             break;
           }
+
           if (attempt < maxAttempts) {
-            // Backoff gives a restarted database/broker a chance to recover
-            // before we burn the whole budget in a few milliseconds.
-            await sleep(retryDelayMs);
+            consumerStats.retried += 1;
+            // Exponential backoff with jitter (Day 8): fixed-delay retries
+            // re-synchronise every worker the moment a dependency degrades.
+            const backoffMs = consumerBackoffMs(attempt, retryDelayMs, retryMaxDelayMs);
+            log('handler failed, retrying', {
+              eventType: envelope.eventType,
+              topic,
+              partition,
+              offset,
+              attempt,
+              maxAttempts,
+              backoffMs,
+              error: lastError,
+            });
+            await sleep(backoffMs);
           }
         }
       }
 
-      logError(
-        `giving up group=${groupId} topic=${topic} offset=${offset} ` +
-          `eventType=${envelope.eventType} eventId=${envelope.eventId} ` +
-          `attempts=${permanent ? 1 : maxAttempts} error="${lastError}"`
-      );
+      consumerStats.deadLettered += 1;
+      logError('giving up, dead-lettering message', {
+        group: groupId,
+        topic,
+        partition,
+        offset,
+        eventType: envelope.eventType,
+        attempts: permanent ? 1 : maxAttempts,
+        permanent,
+        error: lastError,
+      });
 
       await deadLetter(
         publisher,

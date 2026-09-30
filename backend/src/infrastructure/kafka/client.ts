@@ -1,6 +1,10 @@
 import { Admin, Kafka, logLevel } from 'kafkajs';
 import { config } from '../../config';
+import { getLogger } from '../logging';
 import { ALL_TOPICS, TOPIC_DEFINITIONS, type TopicName } from './topics';
+
+/** Structured logger for this module (Day 8). */
+const kafkaLogger = getLogger({ module: 'kafka' });
 
 /**
  * Kafka client + lifecycle (Day 7).
@@ -111,10 +115,11 @@ export async function ensureTopics(): Promise<TopicProvisionResult> {
 
   const created = missing.map((m) => m.name);
   const present = ALL_TOPICS.filter((name) => !created.includes(name));
-  console.log(
-    `[kafka] topics ready brokers=${brokerSummary()} created=[${created.join(',')}] ` +
-      `existing=[${present.join(',')}]`
-  );
+  kafkaLogger.info('topics ready', {
+    brokers: brokerSummary(),
+    created,
+    existing: present,
+  });
   return { created, existing: present };
 }
 

@@ -27,4 +27,10 @@ export {
   type CacheLookup,
   type CacheStats,
 } from './cache';
-export { consumeRateLimit, type RateLimitResult } from './rateLimiter';
+export {
+  consumeRateLimit,
+  getRateLimitStats,
+  resetRateLimitStats,
+  type RateLimitResult,
+  type RateLimitStats,
+} from './rateLimiter';

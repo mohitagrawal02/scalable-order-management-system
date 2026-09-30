@@ -370,6 +370,14 @@ export async function requireKafka(timeoutMs = 15_000): Promise<void> {
 interface ApiOptions {
   token?: string;
   body?: unknown;
+  /**
+   * Extra request headers.
+   *
+   * Added for Day 8 so a test can send its own `X-Request-ID` and verify the
+   * server reuses it. Applied BEFORE the derived ones, so `token` and
+   * `Content-Type` still win over anything set here.
+   */
+  headers?: Record<string, string>;
 }
 
 /** Minimal typed JSON client against the test server. */
@@ -378,7 +386,7 @@ export async function api<T = any>(
   path: string,
   options: ApiOptions = {}
 ): Promise<ApiResult<T>> {
-  const headers: Record<string, string> = {};
+  const headers: Record<string, string> = { ...(options.headers ?? {}) };
   if (options.token) headers.Authorization = `Bearer ${options.token}`;
   if (options.body !== undefined) headers['Content-Type'] = 'application/json';
 

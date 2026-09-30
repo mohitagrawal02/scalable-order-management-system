@@ -4,12 +4,13 @@ A **learning-oriented, production-style** e-commerce platform. Designed to grow
 from a small, well-structured application into a scalable event-driven system â€”
 one deliberate stage at a time.
 
-> **Status: Days 1–6 complete.** Backend foundation, MySQL schema, JWT auth,
+> **Status: Days 1–8 complete.** Backend foundation, MySQL schema, JWT auth,
 > admin product catalog, the shopping cart, transactional checkout with
 > concurrency-safe inventory, simulated payments with idempotency +
-> notifications, and **Redis catalog caching + login rate limiting with graceful
-> degradation**. Admin order management, the inventory API, and the frontend
-> come next.
+> notifications, **Kafka events through a transactional outbox**, and
+> **observability: structured logs with request correlation, route-pattern
+> metrics, liveness/readiness probes and graceful shutdown**. Admin order
+> management, the inventory API, Docker/CI and the frontend come next.
 
 ---
 
@@ -41,7 +42,8 @@ The platform will eventually support:
 | Cache/Rate | Redis (ioredis)                           | O(1) catalog caching, atomic login rate-limiting, fail-open fallback  |
 | Frontend   | React + TypeScript *(starts in a later stage)* | Declarative UI, strongest ecosystem for hooking up to a JSON API   |
 | Infra      | Kafka 3 (KRaft) + transactional outbox    | Async side effects off the request path; Docker still deferred   |
-## 3. Current architecture (Days 1-7)
+| Ops        | Structured logs, request ids, in-process metrics, liveness/readiness, graceful shutdown | Be observable and deployable without adding a metrics stack |
+## 3. Current architecture (Days 1-8)
 
 ```
 +--------------------------+          +--------------------------+
@@ -71,6 +73,12 @@ The platform will eventually support:
 
 - **Modular monolith**: one deployable backend with clearly separated modules.
   No microservices yet (see `docs/ARCHITECTURE.md`).
+- **Day 8 is cross-cutting, not a module**: every request gets an id that follows
+  it into every log line (`AsyncLocalStorage`), one access-log line and one
+  metric per route *pattern*; `/api/health/live` and `/api/health/ready` answer
+  "restart me?" and "route to me?" separately; `GET /api/metrics` reports the
+  counters; and both processes shut down through the same named-step sequence.
+  Details and trade-offs in [`docs/RELIABILITY.md`](./docs/RELIABILITY.md).
 - The API and the worker are two entrypoints into the SAME codebase. Kafka only
   carries asynchronous side effects and never sits on the request path; its
   status never changes the health endpoint's overall status (see `docs/KAFKA.md`).
@@ -108,8 +116,9 @@ ecommerce-platform/
 │   ├── ORDERS.md             # transactional checkout, locking, price snapshots
 │   ├── PAYMENTS.md           # simulated payment processing, idempotency & state machine
 │   ├── NOTIFICATIONS.md      # notifications & user scoping
-│   └── REDIS.md              # Redis catalog cache, rate limiting & fail-open resilience
-│   └── KAFKA.md              # outbox, at-least-once delivery, consumer idempotency
+│   ├── REDIS.md              # Redis catalog cache, rate limiting & fail-open resilience
+│   ├── KAFKA.md              # outbox, at-least-once delivery, consumer idempotency
+│   └── RELIABILITY.md        # structured logs, request ids, metrics, probes, shutdown
 ├── .gitignore
 â””â”€â”€ README.md
 ```
@@ -180,6 +189,17 @@ Startup order: **MySQL -> Kafka broker -> API -> worker**.
 curl http://localhost:4000/api/health
 # â†’ {"status":"ok","service":"ecommerce-platform-backend","database":"up",...}
 ```
+
+Probes and counters (Day 8):
+
+```bash
+curl -i http://localhost:4000/api/health/live   # "alive" - restart me?  (never checks a dependency)
+curl http://localhost:4000/api/health/ready     # "ready" - route to me?  (503 only if MySQL is down)
+curl http://localhost:4000/api/metrics          # counters: http / cache / rate limit / events
+```
+
+Every response also carries `X-Request-ID`. Quote that id and every log line
+written about the request can be found — see `docs/RELIABILITY.md`.
 
 ### Useful scripts
 
@@ -397,6 +417,37 @@ delivery, consumer idempotency, dead-letter queues).
       Kafka never deciding the overall status
 - [x] `docs/KAFKA.md`
 
+**Done (Day 8)**
+
+- [x] Structured JSON logger (`src/infrastructure/logging/`) — level filtering,
+      key-based redaction at any depth, error serialization, `setLogSink()` as a
+      test seam; **no** pino/winston dependency, and zero `console.*` left
+- [x] Request ids: `X-Request-ID` echoed (caller-supplied ids reused only if they
+      match `[A-Za-z0-9._-]{8,64}`), propagated to every log line through
+      `AsyncLocalStorage` — no function signature changed
+- [x] One access-log line per request (`info`/`warn`/`error` by outcome) + a
+      global error policy that stops logging 4xx as failures
+- [x] In-process HTTP metrics keyed by **route pattern**, not URL; digit/UUID
+      segments collapsed and a 200-label cap so cardinality cannot explode
+- [x] `GET /api/metrics` — http + cache + `security.rateLimit.degraded` +
+      producer/outbox/consumer counters, bearer-token gated via `METRICS_TOKEN`
+- [x] `GET /api/health/live` (checks nothing, so no dependency can restart the
+      fleet) and `GET /api/health/ready` (only MySQL gates traffic)
+- [x] Graceful shutdown as an ordered, named, individually-timed step list with an
+      idempotent signal handler, a drain window for in-flight requests, an
+      idle-socket sweep, and a watchdog that names the step that hung
+- [x] **Defect fixed**: the outbox retry budget was being consumed by the 2s poll
+      interval, so ~20s of broker downtime dead-lettered every queued event;
+      retries now back off 1s → 60s via `outbox_events.next_attempt_at` (new
+      column + migration)
+- [x] **Defect fixed**: the rate limiter's fail-open was invisible — it is now a
+      counted, timestamped security signal (`degraded`)
+- [x] Failure-injection tests: Redis down under traffic, a throwing shutdown step,
+      a wedged step, duplicate SIGTERMs, a request in flight while closing, a
+      keep-alive socket, a request overrunning the drain, a broker refusing
+      publishes (`npm test`: 108 tests, 8 files)
+- [x] `docs/RELIABILITY.md` + the Day-8 variables in `.env.example`
+
 **Not done yet â€” deliberately**
 
 - âŒ Admin order management, order cancellation, refunds
@@ -413,7 +464,8 @@ delivery, consumer idempotency, dead-letter queues).
 | 4 | ~~Cart + orders + transactional order creation~~ **done (Day 4)** |
 | 5 | ~~Simulated payments, inventory reservations, order status transitions, notifications~~ **done (Day 5)** |
 | 6 | ~~Caching (Redis), background workers, rate limiting~~ **done (Day 6)** |
-| 7 | ~~Events (Kafka)~~ **done (Day 7)**, observability, containerization (Docker), CI |
+| 7 | ~~Events (Kafka)~~ **done (Day 7)** |
+| 8 | ~~Observability: logs, request ids, metrics, probes, graceful shutdown~~ **done (Day 8)**; containerization (Docker), CI |
 
 Exact scope may change as we learn; the rule stays: **only add what solves a
 real problem we have actually hit**.

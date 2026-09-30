@@ -181,6 +181,37 @@ In Day 6, Redis is added to accelerate read-heavy catalog traffic and protect au
 
 Full details: [`REDIS.md`](./REDIS.md).
 
+## 5.9 Reliability & observability notes (Day 8)
+
+Days 1-7 answered "does it work?". Day 8 answers "could anyone tell?" — and it is
+architecture rather than polish, because three of its decisions change what the
+system *does* under failure:
+
+- **Liveness must not check dependencies.** `/api/health/live` reads nothing, so a
+  database failover cannot fail every probe at once and make the orchestrator
+  restart a fleet that was only waiting. Traffic routing is `/api/health/ready`,
+  where MySQL is required and Redis and Kafka are explicitly not.
+- **Correlation is a cross-cutting concern.** A request id is bound once, in the
+  first middleware, and reaches the cache, the outbox and the error handler
+  through `AsyncLocalStorage` — no signature changed. The worker binds the
+  equivalent per message, and the event `correlationId` is the seam between the
+  two processes.
+- **Metrics must bound their own cardinality.** Labels are route *patterns*, with
+  digit/UUID segments collapsed and a hard label cap, because a metrics map that
+  keys on user input is a memory leak with a dashboard attached.
+- **Shutdown is a sequence, not a callback.** Named steps run in the order that
+  makes each later close safe; one step failing is recorded and does not skip the
+  rest; a drain window plus an idle-socket sweep plus a watchdog mean a deploy
+  neither drops a client mid-request nor hangs until the platform kills us.
+- **Nothing here adds infrastructure.** No metrics server, no sidecar, no log
+  shipper — an in-process registry, JSON on stdout, and endpoints a process
+  supervisor can already reach. Prometheus is an evolution step
+  ([§6](#6-how-the-architecture-is-expected-to-evolve)), not a prerequisite.
+
+Full details, including the defects found while inspecting Day 7 (notably the
+outbox retry budget being consumed by the poll interval):
+[`RELIABILITY.md`](./RELIABILITY.md).
+
 ## 6. How the architecture is expected to evolve
 
 1. **Day 2–4 (done) — features:** auth, products, cart, transactional

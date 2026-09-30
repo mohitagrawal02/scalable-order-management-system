@@ -1,5 +1,9 @@
 import Redis, { RedisOptions } from 'ioredis';
 import { config } from '../../config';
+import { getLogger } from '../logging';
+
+/** Structured logger for this module (Day 8). */
+const redisLogger = getLogger({ module: 'redis' });
 
 /**
  * Redis connection + lifecycle (Day 6).
@@ -58,12 +62,12 @@ redis.on('error', (err: Error) => {
   lastLoggedErrorMessage = message;
   lastLoggedAt = now;
   hasLoggedFailure = true;
-  console.error(`[redis] connection error url=${redactUrl(config.redis.url)} error="${message}"`);
+  redisLogger.error('redis connection error', { url: redactUrl(config.redis.url), error: message });
 });
 
 redis.on('ready', () => {
   if (hasLoggedFailure) {
-    console.log(`[redis] reconnected url=${redactUrl(config.redis.url)}`);
+    redisLogger.info('redis reconnected', { url: redactUrl(config.redis.url) });
     hasLoggedFailure = false;
   }
 });

@@ -1,4 +1,8 @@
+import { getLogger } from '../logging';
 import { redis } from './client';
+
+/** Structured logger for this module (Day 8). */
+const rateLimitLogger = getLogger({ module: 'rate-limit' });
 
 /**
  * Redis-backed rate limiter primitive (Day 6).
@@ -54,6 +58,39 @@ export interface RateLimitResult {
 }
 
 /**
+ * Counters for `/api/metrics` (Day 8).
+ *
+ * `degraded` is the one that matters operationally: it counts decisions that
+ * were made WITHOUT Redis, i.e. requests that were allowed only because the
+ * limiter failed open. A steady stream of these is the signal that brute-force
+ * protection is currently off, which is invisible if you only count 429s.
+ */
+export interface RateLimitStats {
+  checks: number;
+  blocked: number;
+  degraded: number;
+  lastDegradedAt: string | null;
+}
+
+const stats: RateLimitStats = {
+  checks: 0,
+  blocked: 0,
+  degraded: 0,
+  lastDegradedAt: null,
+};
+
+export function getRateLimitStats(): RateLimitStats {
+  return { ...stats };
+}
+
+export function resetRateLimitStats(): void {
+  stats.checks = 0;
+  stats.blocked = 0;
+  stats.degraded = 0;
+  stats.lastDegradedAt = null;
+}
+
+/**
  * Counts one attempt against `key` and decides.
  *
  * Failure policy: **fail open**. If Redis cannot answer, the request is
@@ -82,6 +119,8 @@ export async function consumeRateLimit(
     }
 
     const retryAfterSeconds = ttl > 0 ? ttl : windowSeconds;
+    stats.checks += 1;
+    if (count > limit) stats.blocked += 1;
     return {
       allowed: count <= limit,
       count,
@@ -91,9 +130,14 @@ export async function consumeRateLimit(
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error(
-      `[rate-limit] error key="${key}" error="${message}" policy=fail-open (request allowed)`
-    );
+    stats.checks += 1;
+    stats.degraded += 1;
+    stats.lastDegradedAt = new Date().toISOString();
+    rateLimitLogger.warn('rate limit degraded, allowing request', {
+      key,
+      error: message,
+      policy: 'fail-open',
+    });
     return {
       allowed: true,
       count: 0,

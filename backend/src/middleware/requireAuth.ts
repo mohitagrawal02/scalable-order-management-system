@@ -1,6 +1,7 @@
 import { NextFunction, Request, Response } from 'express';
 import { prisma } from '../config/prisma';
 import { AppError } from '../errors/AppError';
+import { updateLogContext } from '../infrastructure/logging';
 import { verifyToken } from '../modules/auth/auth.utils';
 
 /**
@@ -53,6 +54,12 @@ export async function requireAuth(
       },
       token,
     };
+
+    // From this line on, every log written inside this request says WHO made it
+    // - without any handler passing a user id around (Day 8). The id is an
+    // opaque number, not the email or the token: logs correlate, they do not
+    // double as a copy of the request.
+    updateLogContext({ userId: user.id });
 
     next();
   } catch (err) {

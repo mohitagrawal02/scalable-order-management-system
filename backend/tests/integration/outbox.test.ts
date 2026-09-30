@@ -224,7 +224,50 @@ describe('Transactional outbox + consumer idempotency (Day 7)', () => {
     assert.equal(row!.attempts, 1, 'the attempt is counted so a budget exists');
     assert.match(row!.lastError ?? '', /simulated broker outage/);
     assert.equal(row!.publishedAt, null);
+    assert.ok(row!.nextAttemptAt, 'the next attempt is SCHEDULED, not immediate (Day 8)');
     assert.ok(result.failed >= 1);
+  });
+
+  it('defers a failed row instead of burning its retry budget on every tick', async () => {
+    const eventId = await enqueueScratch();
+
+    await dispatchWithRecording({ failWith: 'simulated broker outage' });
+    const deferred = await readRow(eventId);
+    assert.equal(deferred!.status, 'PENDING');
+    assert.equal(deferred!.attempts, 1);
+    assert.ok(
+      deferred!.nextAttemptAt!.getTime() > Date.now(),
+      'the retry is in the future, so polling cannot consume it'
+    );
+
+    // THE REGRESSION THIS TEST EXISTS FOR.
+    // Day 7 counted one attempt per DISPATCH TICK for every pending row, so with
+    // the default 2s interval and a 10-attempt budget a row was parked as DEAD
+    // after ~20 seconds of broker unavailability - shorter than a broker restart.
+    // A routine 30s blip therefore dead-lettered every queued event. Repeated
+    // polling must now leave a deferred row exactly where it is.
+    for (let tick = 0; tick < 3; tick += 1) {
+      await dispatchWithRecording({ failWith: 'still down' });
+    }
+
+    const afterTicks = await readRow(eventId);
+    assert.equal(afterTicks!.attempts, 1, 'a deferred row is not re-attempted by polling');
+    assert.equal(afterTicks!.status, 'PENDING', 'and it is nowhere closer to DEAD');
+
+    // When the backoff expires (here: by clearing the schedule) the row is tried
+    // again, and only then does the attempt counter move.
+    await prisma.outboxEvent.update({
+      where: { eventId },
+      data: { nextAttemptAt: null },
+    });
+    await dispatchWithRecording({ failWith: 'still down' });
+
+    const eligible = await readRow(eventId);
+    assert.equal(eligible!.attempts, 2, 'eligible again → attempted again');
+    assert.ok(
+      eligible!.nextAttemptAt!.getTime() > deferred!.nextAttemptAt!.getTime(),
+      'and the next attempt is scheduled further out (exponential backoff)'
+    );
   });
 
   it('parks a row as DEAD once its retry budget is exhausted', async () => {
@@ -372,6 +415,15 @@ describe('Transactional outbox + consumer idempotency (Day 7)', () => {
   // ------------------------------------------------------- visibility
   it('reports the backlog on /api/health without letting it gate status', async () => {
     // Start from an empty backlog so the delta below is unambiguous.
+    //
+    // Day 8 adds a wrinkle: a row that failed to publish is now DEFERRED until
+    // its backoff expires, so a bare `dispatchOutbox()` no longer sweeps
+    // everything that has ever failed. Clearing the schedule here says what the
+    // test actually means: "wait for the backlog to be workable, then measure".
+    await prisma.outboxEvent.updateMany({
+      where: { status: 'PENDING' },
+      data: { nextAttemptAt: null },
+    });
     await dispatchWithRecording();
     const eventId = await enqueueScratch();
 
