@@ -171,10 +171,10 @@ jobs:
             apache/kafka:4.0.2
 
       - name: Wait until the broker answers
-        # tests/integration/helpers.ts SKIPS the Kafka suite when no broker
-        # answers - right on a laptop, wrong for CI, where a silently skipped
-        # group would be reported as a pass. Reachability is therefore proven
-        # here, loudly, before a single test runs.
+        # tests/integration/helpers.ts FAILS LOUDLY when no broker answers (a
+        # silently skipped group would look like a pass) - so prove reachability
+        # here, early and with a clear message, instead of a 15s timeout buried
+        # inside a test hook.
         run: |
           for i in $(seq 1 60); do
             if docker exec ci-kafka /opt/kafka/bin/kafka-broker-api-versions.sh \
@@ -206,7 +206,7 @@ jobs:
   # --------------------------------------------------------------------------
   docker:
     name: Image build + Compose smoke test
-    needs: static
+    needs: integration-tests
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -278,7 +278,10 @@ jobs:
         run: |
           set -euo pipefail
           docker compose stop -t 20 api
-          API_ID=$(docker compose ps -q api)
+          # -a on purpose: `compose ps` hides STOPPED containers by default, and
+          # this container has just been stopped - without -a the id comes back
+          # empty and `docker inspect` fails with a misleading "no such container".
+          API_ID=$(docker compose ps -aq api)
           EXIT_CODE=$(docker inspect -f '{{ .State.ExitCode }}' "$API_ID")
           echo "api container exit code: $EXIT_CODE"
           test "$EXIT_CODE" = "0"
